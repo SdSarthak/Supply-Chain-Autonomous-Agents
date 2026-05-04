@@ -1,3 +1,9 @@
-google-generativeai>=0.8.0
-redis>=5.0.0
-python-dotenv>=1.0.0
+# Core AI
+google-generativeai==0.8.3
+google-ai-generativelanguage==0.6.10
+
+# Memory & State
+redis==5.0.1
+
+# Config
+python-dotenv==1.0.1

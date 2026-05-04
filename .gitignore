@@ -1,40 +1,79 @@
-# Environment
+# ── Environment ──────────────────────────────────────────────
 .env
 .env.local
+.env.*.local
 
-# Python
+# ── Python ───────────────────────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.pyd
 .Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / packaging
+*.egg
 *.egg-info/
 dist/
 build/
+wheels/
+MANIFEST
+
+# Virtual environments
 .venv/
 venv/
-.ipynb_checkpoints/
+env/
+ENV/
 
-# Database files
+# Type checkers & linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Database ──────────────────────────────────────────────────
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
-# Logs
+# ── Logs ─────────────────────────────────────────────────────
 *.log
 logs/
 
-# OS
+# ── OS ───────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+Desktop.ini
 
-# IDE
+# ── IDE ──────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
+*.swo
+*~
+.project
+.classpath
 
-# Node (not used but guard)
-node_modules/
-npm-debug.log*
-
+# ── Docker ───────────────────────────────────────────────────
+# Keep Dockerfile and docker-compose.yml tracked
+# Ignore local override files
+docker-compose.override.yml
