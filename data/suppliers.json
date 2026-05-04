@@ -1,0 +1,471 @@
+[
+  {
+    "supplier_id": "SUP-001",
+    "name": "TechParts GmbH",
+    "country": "Germany",
+    "region": "EMEA",
+    "contact": "hans.mueller@techparts.de",
+    "payment_terms": "Net30",
+    "skus": [
+      "SKU-001",
+      "SKU-003",
+      "SKU-006",
+      "SKU-008"
+    ],
+    "lead_time_days": 14,
+    "reliability_score": 0.92,
+    "on_time_delivery_rate": 0.94,
+    "quality_rejection_rate": 0.02,
+    "min_order_qty": 10,
+    "pricing": {
+      "SKU-001": {
+        "list_price": 48.5,
+        "tier2_qty": 100,
+        "tier2_price": 44.0,
+        "tier3_qty": 500,
+        "tier3_price": 40.0
+      },
+      "SKU-003": {
+        "list_price": 185.0,
+        "tier2_qty": 20,
+        "tier2_price": 170.0,
+        "tier3_qty": 100,
+        "tier3_price": 158.0
+      },
+      "SKU-006": {
+        "list_price": 22.0,
+        "tier2_qty": 50,
+        "tier2_price": 19.5,
+        "tier3_qty": 200,
+        "tier3_price": 17.0
+      },
+      "SKU-008": {
+        "list_price": 12.8,
+        "tier2_qty": 100,
+        "tier2_price": 11.5,
+        "tier3_qty": 500,
+        "tier3_price": 10.2
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-001",
+        "sku": "SKU-001",
+        "qty": 200,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-008",
+        "sku": "SKU-008",
+        "qty": 500,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-015",
+        "sku": "SKU-003",
+        "qty": 50,
+        "on_time": false,
+        "quality_ok": true
+      }
+    ]
+  },
+  {
+    "supplier_id": "SUP-002",
+    "name": "ElectroPro Asia",
+    "country": "Taiwan",
+    "region": "APAC",
+    "contact": "sales@electropro.tw",
+    "payment_terms": "Net45",
+    "skus": [
+      "SKU-002",
+      "SKU-004",
+      "SKU-007",
+      "SKU-010"
+    ],
+    "lead_time_days": 21,
+    "reliability_score": 0.87,
+    "on_time_delivery_rate": 0.89,
+    "quality_rejection_rate": 0.03,
+    "min_order_qty": 20,
+    "pricing": {
+      "SKU-002": {
+        "list_price": 95.0,
+        "tier2_qty": 30,
+        "tier2_price": 88.0,
+        "tier3_qty": 100,
+        "tier3_price": 80.0
+      },
+      "SKU-004": {
+        "list_price": 62.0,
+        "tier2_qty": 50,
+        "tier2_price": 56.0,
+        "tier3_qty": 200,
+        "tier3_price": 50.0
+      },
+      "SKU-007": {
+        "list_price": 340.0,
+        "tier2_qty": 10,
+        "tier2_price": 310.0,
+        "tier3_qty": 50,
+        "tier3_price": 285.0
+      },
+      "SKU-010": {
+        "list_price": 28.5,
+        "tier2_qty": 100,
+        "tier2_price": 25.0,
+        "tier3_qty": 500,
+        "tier3_price": 21.5
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-003",
+        "sku": "SKU-004",
+        "qty": 100,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-011",
+        "sku": "SKU-010",
+        "qty": 300,
+        "on_time": false,
+        "quality_ok": false
+      },
+      {
+        "po": "PO-2024-019",
+        "sku": "SKU-002",
+        "qty": 60,
+        "on_time": true,
+        "quality_ok": true
+      }
+    ]
+  },
+  {
+    "supplier_id": "SUP-003",
+    "name": "FastFix Hardware Co",
+    "country": "USA",
+    "region": "AMER",
+    "contact": "orders@fastfix.com",
+    "payment_terms": "Net15",
+    "skus": [
+      "SKU-005",
+      "SKU-009"
+    ],
+    "lead_time_days": 7,
+    "reliability_score": 0.95,
+    "on_time_delivery_rate": 0.97,
+    "quality_rejection_rate": 0.01,
+    "min_order_qty": 50,
+    "pricing": {
+      "SKU-005": {
+        "list_price": 18.5,
+        "tier2_qty": 200,
+        "tier2_price": 16.0,
+        "tier3_qty": 1000,
+        "tier3_price": 13.5
+      },
+      "SKU-009": {
+        "list_price": 8.2,
+        "tier2_qty": 500,
+        "tier2_price": 7.0,
+        "tier3_qty": 2000,
+        "tier3_price": 5.8
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-005",
+        "sku": "SKU-005",
+        "qty": 500,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-012",
+        "sku": "SKU-009",
+        "qty": 1000,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-021",
+        "sku": "SKU-005",
+        "qty": 800,
+        "on_time": true,
+        "quality_ok": true
+      }
+    ]
+  },
+  {
+    "supplier_id": "SUP-004",
+    "name": "PneumaTech Italia",
+    "country": "Italy",
+    "region": "EMEA",
+    "contact": "vendite@pneumatech.it",
+    "payment_terms": "Net30",
+    "skus": [
+      "SKU-001",
+      "SKU-003",
+      "SKU-006"
+    ],
+    "lead_time_days": 18,
+    "reliability_score": 0.88,
+    "on_time_delivery_rate": 0.9,
+    "quality_rejection_rate": 0.025,
+    "min_order_qty": 5,
+    "pricing": {
+      "SKU-001": {
+        "list_price": 51.0,
+        "tier2_qty": 50,
+        "tier2_price": 46.0,
+        "tier3_qty": 200,
+        "tier3_price": 41.5
+      },
+      "SKU-003": {
+        "list_price": 178.0,
+        "tier2_qty": 20,
+        "tier2_price": 162.0,
+        "tier3_qty": 100,
+        "tier3_price": 150.0
+      },
+      "SKU-006": {
+        "list_price": 24.5,
+        "tier2_qty": 50,
+        "tier2_price": 21.5,
+        "tier3_qty": 200,
+        "tier3_price": 18.8
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-007",
+        "sku": "SKU-006",
+        "qty": 100,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-016",
+        "sku": "SKU-001",
+        "qty": 80,
+        "on_time": false,
+        "quality_ok": true
+      }
+    ]
+  },
+  {
+    "supplier_id": "SUP-005",
+    "name": "SensorWorks Korea",
+    "country": "South Korea",
+    "region": "APAC",
+    "contact": "biz@sensorworks.kr",
+    "payment_terms": "Net30",
+    "skus": [
+      "SKU-004",
+      "SKU-007",
+      "SKU-010"
+    ],
+    "lead_time_days": 16,
+    "reliability_score": 0.91,
+    "on_time_delivery_rate": 0.93,
+    "quality_rejection_rate": 0.015,
+    "min_order_qty": 25,
+    "pricing": {
+      "SKU-004": {
+        "list_price": 58.0,
+        "tier2_qty": 100,
+        "tier2_price": 52.0,
+        "tier3_qty": 500,
+        "tier3_price": 46.0
+      },
+      "SKU-007": {
+        "list_price": 320.0,
+        "tier2_qty": 15,
+        "tier2_price": 295.0,
+        "tier3_qty": 60,
+        "tier3_price": 270.0
+      },
+      "SKU-010": {
+        "list_price": 26.0,
+        "tier2_qty": 200,
+        "tier2_price": 22.5,
+        "tier3_qty": 1000,
+        "tier3_price": 19.0
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-009",
+        "sku": "SKU-010",
+        "qty": 400,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-017",
+        "sku": "SKU-004",
+        "qty": 150,
+        "on_time": true,
+        "quality_ok": true
+      }
+    ]
+  },
+  {
+    "supplier_id": "SUP-006",
+    "name": "BearingMaster Poland",
+    "country": "Poland",
+    "region": "EMEA",
+    "contact": "export@bearingmaster.pl",
+    "payment_terms": "Net45",
+    "skus": [
+      "SKU-008",
+      "SKU-001"
+    ],
+    "lead_time_days": 12,
+    "reliability_score": 0.93,
+    "on_time_delivery_rate": 0.95,
+    "quality_rejection_rate": 0.012,
+    "min_order_qty": 50,
+    "pricing": {
+      "SKU-008": {
+        "list_price": 11.9,
+        "tier2_qty": 200,
+        "tier2_price": 10.5,
+        "tier3_qty": 1000,
+        "tier3_price": 9.2
+      },
+      "SKU-001": {
+        "list_price": 46.0,
+        "tier2_qty": 100,
+        "tier2_price": 41.5,
+        "tier3_qty": 500,
+        "tier3_price": 37.0
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-006",
+        "sku": "SKU-008",
+        "qty": 600,
+        "on_time": true,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-014",
+        "sku": "SKU-008",
+        "qty": 800,
+        "on_time": true,
+        "quality_ok": true
+      }
+    ]
+  },
+  {
+    "supplier_id": "SUP-007",
+    "name": "ConsumaParts Mexico",
+    "country": "Mexico",
+    "region": "AMER",
+    "contact": "ventas@consumaparts.mx",
+    "payment_terms": "Net20",
+    "skus": [
+      "SKU-005",
+      "SKU-009",
+      "SKU-002"
+    ],
+    "lead_time_days": 10,
+    "reliability_score": 0.84,
+    "on_time_delivery_rate": 0.86,
+    "quality_rejection_rate": 0.04,
+    "min_order_qty": 100,
+    "pricing": {
+      "SKU-005": {
+        "list_price": 17.0,
+        "tier2_qty": 300,
+        "tier2_price": 15.0,
+        "tier3_qty": 1500,
+        "tier3_price": 12.5
+      },
+      "SKU-009": {
+        "list_price": 7.8,
+        "tier2_qty": 1000,
+        "tier2_price": 6.5,
+        "tier3_qty": 5000,
+        "tier3_price": 5.2
+      },
+      "SKU-002": {
+        "list_price": 88.0,
+        "tier2_qty": 50,
+        "tier2_price": 80.0,
+        "tier3_qty": 200,
+        "tier3_price": 72.0
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-010",
+        "sku": "SKU-009",
+        "qty": 2000,
+        "on_time": false,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-018",
+        "sku": "SKU-005",
+        "qty": 400,
+        "on_time": true,
+        "quality_ok": false
+      }
+    ]
+  },
+  {
+    "supplier_id": "SUP-008",
+    "name": "WireTech India",
+    "country": "India",
+    "region": "APAC",
+    "contact": "supply@wiretech.in",
+    "payment_terms": "Net30",
+    "skus": [
+      "SKU-002",
+      "SKU-004"
+    ],
+    "lead_time_days": 25,
+    "reliability_score": 0.82,
+    "on_time_delivery_rate": 0.85,
+    "quality_rejection_rate": 0.05,
+    "min_order_qty": 30,
+    "pricing": {
+      "SKU-002": {
+        "list_price": 78.0,
+        "tier2_qty": 60,
+        "tier2_price": 70.0,
+        "tier3_qty": 250,
+        "tier3_price": 62.0
+      },
+      "SKU-004": {
+        "list_price": 54.0,
+        "tier2_qty": 100,
+        "tier2_price": 48.0,
+        "tier3_qty": 400,
+        "tier3_price": 42.0
+      }
+    },
+    "past_deliveries": [
+      {
+        "po": "PO-2024-013",
+        "sku": "SKU-002",
+        "qty": 80,
+        "on_time": false,
+        "quality_ok": true
+      },
+      {
+        "po": "PO-2024-020",
+        "sku": "SKU-004",
+        "qty": 200,
+        "on_time": true,
+        "quality_ok": true
+      }
+    ]
+  }
+]

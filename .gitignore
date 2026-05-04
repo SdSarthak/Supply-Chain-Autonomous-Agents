@@ -1,0 +1,26 @@
+.env
+/.env
+# Ignore node_modules
+/node_modules
+# Ignore build output
+/dist
+# Ignore logs
+/logs
+# Ignore OS files
+.DS_Store
+# Ignore IDE files
+/.idea
+# Ignore npm debug files
+npm-debug.log*
+# Ignore yarn debug files
+yarn-debug.log*
+
+/.pycache
+.pycache/
+# Ignore Python virtual environment
+/venv
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints
+# Ignore compiled Python files
+*.pyc
+
