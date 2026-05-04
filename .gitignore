@@ -1,26 +1,40 @@
+# Environment
 .env
-/.env
-# Ignore node_modules
-/node_modules
-# Ignore build output
-/dist
-# Ignore logs
-/logs
-# Ignore OS files
-.DS_Store
-# Ignore IDE files
-/.idea
-# Ignore npm debug files
-npm-debug.log*
-# Ignore yarn debug files
-yarn-debug.log*
+.env.local
 
-/.pycache
-.pycache/
-# Ignore Python virtual environment
-/venv
-# Ignore Jupyter Notebook checkpoints
-.ipynb_checkpoints
-# Ignore compiled Python files
+# Python
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Node (not used but guard)
+node_modules/
+npm-debug.log*
 
