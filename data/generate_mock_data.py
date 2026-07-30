@@ -71,11 +71,35 @@ unit_costs = {
     "SKU-009": 8.20, "SKU-010": 28.50
 }
 
+# reorder_point and max_stock are network-wide figures, so stock is drawn as a
+# network total first and then split across the three warehouses. A few SKUs are
+# deliberately seeded below their reorder point (and one above 90% of max stock)
+# so a cycle has real work to do: reorder alerts, procurement, negotiation.
+LOW_STOCK_SKUS = {"SKU-002", "SKU-005", "SKU-009"}
+OVERSTOCK_SKUS = {"SKU-007"}
+
 for sku in SKUS:
     sid = sku["sku_id"]
-    for loc in locations:
-        on_hand = random.randint(int(reorder_points[sid] * 0.5), max_stocks[sid])
-        reserved = random.randint(0, int(on_hand * 0.2))
+    reorder_point = reorder_points[sid]
+    max_stock = max_stocks[sid]
+
+    if sid in LOW_STOCK_SKUS:
+        network_total = random.randint(int(reorder_point * 0.35), int(reorder_point * 0.95))
+    elif sid in OVERSTOCK_SKUS:
+        network_total = random.randint(int(max_stock * 0.92), max_stock)
+    else:
+        network_total = random.randint(int(reorder_point * 1.4), int(max_stock * 0.8))
+
+    weights = [random.uniform(0.25, 0.45) for _ in locations]
+    total_weight = sum(weights)
+    allocated = 0
+    for idx, loc in enumerate(locations):
+        if idx == len(locations) - 1:
+            on_hand = network_total - allocated  # last location absorbs rounding
+        else:
+            on_hand = int(network_total * weights[idx] / total_weight)
+        allocated += on_hand
+        reserved = random.randint(0, int(on_hand * 0.15))
         inventory_records.append({
             "sku_id": sid,
             "sku_name": sku["name"],
@@ -83,8 +107,8 @@ for sku in SKUS:
             "on_hand": on_hand,
             "reserved": reserved,
             "available": on_hand - reserved,
-            "reorder_point": reorder_points[sid],
-            "max_stock": max_stocks[sid],
+            "reorder_point": reorder_point,
+            "max_stock": max_stock,
             "last_updated": date.today().isoformat(),
             "unit_cost": unit_costs[sid]
         })

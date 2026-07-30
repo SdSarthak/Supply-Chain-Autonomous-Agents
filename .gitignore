@@ -1,7 +1,27 @@
-# ── Environment ──────────────────────────────────────────────
+# ── Environment & secrets ────────────────────────────────────
 .env
 .env.local
 .env.*.local
+*.pem
+*.key
+*.p12
+credentials.json
+serviceAccount*.json
+client_secret*.json
+
+# ── Node (tooling only) ──────────────────────────────────────
+node_modules/
+
+# ── Models & large artifacts ─────────────────────────────────
+*.h5
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.onnx
+*.joblib
+*.parquet
+*.csv.gz
 
 # ── Python ───────────────────────────────────────────────────
 __pycache__/
@@ -49,6 +69,9 @@ coverage.xml
 *.db-wal
 *.sqlite
 *.sqlite3
+
+# Test fixture left behind only if a run is interrupted
+data/inventory.json.testbak
 
 # ── Logs ─────────────────────────────────────────────────────
 *.log

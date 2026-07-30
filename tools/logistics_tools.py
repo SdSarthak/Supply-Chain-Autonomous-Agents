@@ -1,5 +1,6 @@
 import json
 import random
+import zlib
 from datetime import datetime, timedelta
 from config import LOGISTICS_ROUTES_FILE
 
@@ -43,28 +44,65 @@ def get_routes_by_supplier_region(supplier_region: str, warehouse: str = None) -
     return {"supplier_region": supplier_region, "routes": matching, "count": len(matching)}
 
 
+URGENCY_TO_PRIORITY = {
+    "critical": "speed",
+    "urgent": "speed",
+    "normal": "balanced",
+    "low": "cost",
+}
+
+
 def select_optimal_route(routes: list[dict], priority: str = "balanced") -> dict:
     if not routes:
         return {"error": "No routes provided"}
 
+    costs = [r["cost_per_unit"] for r in routes]
+    times = [r["transit_days"] for r in routes]
+    cost_span = (max(costs) - min(costs)) or 1.0
+    time_span = (max(times) - min(times)) or 1.0
+    min_cost, min_time = min(costs), min(times)
+
     def score(r):
         if priority == "speed":
             return -r["transit_days"]
-        elif priority == "cost":
+        if priority == "cost":
             return -r["cost_per_unit"]
-        elif priority == "reliability":
+        if priority == "reliability":
             return r["reliability"]
-        else:  # balanced
-            norm_cost = 1 - (r["cost_per_unit"] / 10)
-            norm_speed = 1 - (r["transit_days"] / 30)
-            return r["reliability"] * 0.4 + norm_cost * 0.35 + norm_speed * 0.25
+        # balanced — min-max normalised within the candidate set so the
+        # weighting means the same thing whatever routes were passed in.
+        norm_cost = 1 - (r["cost_per_unit"] - min_cost) / cost_span
+        norm_speed = 1 - (r["transit_days"] - min_time) / time_span
+        return r["reliability"] * 0.40 + norm_cost * 0.35 + norm_speed * 0.25
 
     best = max(routes, key=score)
     return {
         "selected_route": best,
         "selection_criteria": priority,
+        "candidates_considered": len(routes),
         "score": round(score(best), 4)
     }
+
+
+def select_route_for_region(supplier_region: str, urgency: str = "normal",
+                            warehouse: str = None) -> dict:
+    """Pick the best inbound route from a supplier region for a given urgency.
+
+    Urgency maps onto a selection priority: critical/urgent optimise for
+    transit time, normal balances cost against reliability, low optimises cost.
+    """
+    candidates = get_routes_by_supplier_region(supplier_region, warehouse)["routes"]
+    if not candidates and warehouse:
+        # Warehouse constraint too tight — fall back to any route from the region.
+        candidates = get_routes_by_supplier_region(supplier_region)["routes"]
+    if not candidates:
+        return {"error": f"No inbound routes found for region {supplier_region}"}
+
+    priority = URGENCY_TO_PRIORITY.get(str(urgency).lower(), "balanced")
+    selection = select_optimal_route(candidates, priority)
+    selection["supplier_region"] = supplier_region
+    selection["urgency"] = urgency
+    return selection
 
 
 def estimate_delivery(route_id: str, quantity: int) -> dict:
@@ -87,19 +125,22 @@ def estimate_delivery(route_id: str, quantity: int) -> dict:
 
 
 def track_shipment(po_number: str) -> dict:
-    random.seed(hash(po_number) % 1000)
-    status_idx = random.randint(1, len(SHIPMENT_STATUSES) - 1)
+    # Seeded from the PO number so tracking a shipment twice tells the same
+    # story, using a private RNG so the global random stream stays untouched.
+    # (crc32 rather than hash() — hash() of a str is salted per process.)
+    rng = random.Random(zlib.crc32(po_number.encode("utf-8")))
+    status_idx = rng.randint(1, len(SHIPMENT_STATUSES) - 1)
     status = SHIPMENT_STATUSES[status_idx]
-    last_update = datetime.utcnow() - timedelta(hours=random.randint(1, 48))
-    eta = datetime.utcnow() + timedelta(days=random.randint(0, 10))
+    last_update = datetime.utcnow() - timedelta(hours=rng.randint(1, 48))
+    eta = datetime.utcnow() + timedelta(days=rng.randint(0, 10))
     return {
         "po_number": po_number,
         "status": status,
         "last_update": last_update.isoformat(),
         "estimated_arrival": eta.date().isoformat(),
-        "carrier_tracking_id": f"TRK-{po_number}-{random.randint(10000, 99999)}",
-        "current_location": random.choice(["Frankfurt Hub", "Singapore Port", "Dallas Warehouse",
-                                           "Rotterdam Port", "Hong Kong Airport", "Chicago Hub"])
+        "carrier_tracking_id": f"TRK-{po_number}-{rng.randint(10000, 99999)}",
+        "current_location": rng.choice(["Frankfurt Hub", "Singapore Port", "Dallas Warehouse",
+                                        "Rotterdam Port", "Hong Kong Airport", "Chicago Hub"])
     }
 
 

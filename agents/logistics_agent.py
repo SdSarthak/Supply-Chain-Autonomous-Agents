@@ -1,13 +1,14 @@
+from typing import Optional
+
 import google.ai.generativelanguage as glm
 from agents.base_agent import BaseAgent
 from tools.logistics_tools import (get_available_routes, get_routes_by_supplier_region,
-                                    select_optimal_route, estimate_delivery,
+                                    select_route_for_region, estimate_delivery,
                                     track_shipment)
 from tools.vendor_tools import get_supplier_info
 from memory.redis_memory import RedisMemory
 from memory.sqlite_memory import SQLiteMemory
 from config import GEMINI_FLASH_MODEL
-from datetime import datetime
 
 SYSTEM_PROMPT = """You are a Logistics Agent for an industrial supply chain company.
 Your role is to plan optimal shipping routes for purchase orders, assign carriers,
@@ -30,6 +31,21 @@ TOOL_DECLARATIONS = [
             type=glm.Type.OBJECT,
             properties={
                 "supplier_region": glm.Schema(type=glm.Type.STRING, description="EMEA, APAC, or AMER"),
+                "warehouse": glm.Schema(type=glm.Type.STRING, description="Optional warehouse destination"),
+            },
+            required=["supplier_region"]
+        )
+    ),
+    glm.FunctionDeclaration(
+        name="select_route_for_region",
+        description=("Pick the best inbound route from a supplier region for a given "
+                     "urgency (critical/urgent optimise transit time, normal balances "
+                     "cost and reliability, low optimises cost)"),
+        parameters=glm.Schema(
+            type=glm.Type.OBJECT,
+            properties={
+                "supplier_region": glm.Schema(type=glm.Type.STRING, description="EMEA, APAC, or AMER"),
+                "urgency": glm.Schema(type=glm.Type.STRING, description="critical, urgent, normal or low"),
                 "warehouse": glm.Schema(type=glm.Type.STRING, description="Optional warehouse destination"),
             },
             required=["supplier_region"]
@@ -79,44 +95,15 @@ TOOL_DECLARATIONS = [
     ),
 ]
 
-
-class LogisticsAgent(BaseAgent):
-    def __init__(self, redis_mem: RedisMemory, sqlite_mem: SQLiteMemory):
-        super().__init__(
-            name="logistics",
-            model=GEMINI_FLASH_MODEL,
-            system_prompt=SYSTEM_PROMPT,
-            tools={
-                "get_routes_by_supplier_region": get_routes_by_supplier_region,
-                "get_available_routes": get_available_routes,
-                "estimate_delivery": estimate_delivery,
-                "track_shipment": track_shipment,
-                "get_supplier_info": get_supplier_info,
-            },
-            tool_declarations=TOOL_DECLARATIONS,
-            redis_mem=redis_mem,
-            sqlite_mem=sqlite_mem,
-        )
-
-    def run(self, task: dict) -> dict:
-        purchase_orders = task.get("purchase_orders", [])
-        self._log(f"Assigning logistics for {len(purchase_orders)} purchase orders...")
-        self.save_state({"status": "running", "po_count": len(purchase_orders)})
-
-        if not purchase_orders:
-            return {"agent": self.name, "assignments": [], "message": "No POs to process"}
-
-        prompt = f"""Assign optimal logistics routes for these purchase orders:
+PROMPT_TEMPLATE = """Assign optimal logistics routes for these purchase orders:
 
 {purchase_orders}
 
 For each PO:
 1. Get the supplier's info to determine their region (EMEA/APAC/AMER)
-2. Get available routes from that supplier's region using get_routes_by_supplier_region
-3. Select optimal route based on urgency:
-   - urgent/critical POs: choose lowest transit_days route
-   - normal POs: choose best balance of cost and reliability
-4. Estimate delivery time and cost using estimate_delivery
+2. Call select_route_for_region with that region and the PO's urgency
+3. Estimate delivery time and cost for the selected route using estimate_delivery
+   with the PO quantity
 
 Return JSON:
 {{
@@ -135,30 +122,118 @@ Return JSON:
       "warehouse_destination": "..."
     }}
   ],
+  "unassigned": [{{"po_number": "...", "reason": "..."}}],
   "total_shipping_cost": <number>,
   "avg_transit_days": <number>
 }}"""
 
-        response = self._call_gemini(prompt)
-        self._log("Logistics assignments complete.")
 
-        assignments = []
-        try:
-            import re, json
-            match = re.search(r'\{.*\}', response, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group())
-                for a in parsed.get("assignments", []):
-                    self.sqlite.update_po_status(
-                        po_number=a["po_number"],
-                        status="in_transit",
-                        route_id=a.get("selected_route_id"),
-                        expected_delivery=a.get("estimated_arrival")
-                    )
-                    assignments.append(a)
-                    self._log(f"PO {a['po_number']}: {a.get('carrier')} via {a.get('mode')}, ETA {a.get('estimated_arrival')}")
-        except Exception as e:
-            self._log(f"Warning: Could not parse logistics JSON: {e}")
+class LogisticsAgent(BaseAgent):
+    def __init__(self, redis_mem: RedisMemory, sqlite_mem: SQLiteMemory,
+                 offline: Optional[bool] = None):
+        super().__init__(
+            name="logistics",
+            model=GEMINI_FLASH_MODEL,
+            system_prompt=SYSTEM_PROMPT,
+            tools={
+                "get_routes_by_supplier_region": get_routes_by_supplier_region,
+                "select_route_for_region": select_route_for_region,
+                "get_available_routes": get_available_routes,
+                "estimate_delivery": estimate_delivery,
+                "track_shipment": track_shipment,
+                "get_supplier_info": get_supplier_info,
+            },
+            tool_declarations=TOOL_DECLARATIONS,
+            redis_mem=redis_mem,
+            sqlite_mem=sqlite_mem,
+            offline=offline,
+        )
 
+    # ── deterministic engine ─────────────────────────────────
+    def _offline_result(self, task: dict) -> dict:
+        assignments, unassigned = [], []
+        for po in task.get("purchase_orders", []):
+            po_number = po.get("po_number")
+            supplier = get_supplier_info(po.get("supplier_id", ""))
+            if "error" in supplier:
+                unassigned.append({"po_number": po_number, "reason": supplier["error"]})
+                continue
+
+            selection = select_route_for_region(supplier["region"],
+                                                po.get("urgency", "normal"))
+            if "error" in selection:
+                unassigned.append({"po_number": po_number, "reason": selection["error"]})
+                continue
+
+            route = selection["selected_route"]
+            quantity = int(po.get("quantity", 0) or 0)
+            estimate = estimate_delivery(route["route_id"], quantity)
+            assignments.append({
+                "po_number": po_number,
+                "supplier_id": supplier["supplier_id"],
+                "sku_id": po.get("sku_id"),
+                "selected_route_id": route["route_id"],
+                "carrier": route["carrier"],
+                "mode": route["mode"],
+                "transit_days": route["transit_days"],
+                "estimated_arrival": estimate["estimated_arrival"],
+                "shipping_cost_usd": estimate["total_shipping_cost"],
+                "co2_kg": estimate["co2_kg"],
+                "warehouse_destination": route["destination"],
+                "selection_criteria": selection["selection_criteria"],
+            })
+
+        total_cost = round(sum(a["shipping_cost_usd"] for a in assignments), 2)
+        avg_transit = round(
+            sum(a["transit_days"] for a in assignments) / len(assignments), 1
+        ) if assignments else 0.0
+        return {
+            "assignments": assignments,
+            "unassigned": unassigned,
+            "total_shipping_cost": total_cost,
+            "avg_transit_days": avg_transit,
+        }
+
+    # ── cycle step ───────────────────────────────────────────
+    def _persist(self, assignments: list) -> list:
+        applied = []
+        for a in assignments:
+            po_number = a.get("po_number")
+            if not po_number:
+                continue
+            self.sqlite.update_po_status(
+                po_number=po_number,
+                status="in_transit",
+                route_id=a.get("selected_route_id"),
+                expected_delivery=a.get("estimated_arrival"),
+            )
+            applied.append(a)
+            self._log(f"PO {po_number}: {a.get('carrier')} via {a.get('mode')} "
+                      f"to {a.get('warehouse_destination')}, ETA {a.get('estimated_arrival')}")
+        return applied
+
+    def run(self, task: dict) -> dict:
+        purchase_orders = task.get("purchase_orders", [])
+        self._log(f"Assigning logistics for {len(purchase_orders)} purchase orders...")
+        self.save_state({"status": "running", "po_count": len(purchase_orders)})
+
+        if not purchase_orders:
+            self.save_state({"status": "completed", "assigned": 0})
+            return {"agent": self.name, "assignments": [], "unassigned": [],
+                    "total_shipping_cost": 0.0, "avg_transit_days": 0.0,
+                    "message": "No POs to process"}
+
+        prompt = PROMPT_TEMPLATE.format(purchase_orders=purchase_orders)
+        parsed, raw = self._reason(prompt, task)
+        assignments = self._persist(parsed.get("assignments", []))
+
+        self._log(f"Logistics assignments complete — {len(assignments)} routed.")
         self.save_state({"status": "completed", "assigned": len(assignments)})
-        return {"agent": self.name, "assignments": assignments, "raw_response": response}
+        return {
+            "agent": self.name,
+            "assignments": assignments,
+            "unassigned": parsed.get("unassigned", []),
+            "total_shipping_cost": parsed.get("total_shipping_cost", 0.0),
+            "avg_transit_days": parsed.get("avg_transit_days", 0.0),
+            "raw_response": raw,
+        }

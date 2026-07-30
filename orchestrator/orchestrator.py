@@ -2,11 +2,12 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
+from config import GEMINI_API_KEY, OFFLINE_MODE
 from memory.redis_memory import RedisMemory
 from memory.sqlite_memory import SQLiteMemory
-from orchestrator.message_bus import MessageBus, Message
+from orchestrator.message_bus import MessageBus
 from orchestrator.task_router import TaskRouter
 
 from agents.demand_forecasting_agent import DemandForecastingAgent
@@ -17,221 +18,318 @@ from agents.logistics_agent import LogisticsAgent
 from agents.supplier_performance_agent import SupplierPerformanceAgent
 from agents.risk_agent import RiskAgent
 
+from tools.inventory_tools import list_sku_ids
+from tools.vendor_tools import list_supplier_ids
+
 logger = logging.getLogger(__name__)
 
-ALL_SKUS = [f"SKU-{str(i).zfill(3)}" for i in range(1, 11)]
-ALL_SUPPLIERS = [f"SUP-{str(i).zfill(3)}" for i in range(1, 9)]
+# Bus priorities: 1 = critical path, 5 = background.
+TASK_PRIORITIES = {
+    "check_inventory": 1,
+    "forecast_demand": 2,
+    "create_procurement": 1,
+    "negotiate_po": 2,
+    "assign_logistics": 2,
+    "score_suppliers": 4,
+    "assess_risk": 3,
+}
+
+AGENT_CLASSES = {
+    "demand_forecasting": DemandForecastingAgent,
+    "inventory": InventoryAgent,
+    "procurement": ProcurementAgent,
+    "negotiation": NegotiationAgent,
+    "logistics": LogisticsAgent,
+    "supplier_performance": SupplierPerformanceAgent,
+    "risk": RiskAgent,
+}
 
 
 class Orchestrator:
-    def __init__(self):
-        print("\n" + "="*60)
-        print("  SUPPLY CHAIN AUTONOMOUS INTELLIGENCE NETWORK")
-        print("  Initializing...")
-        print("="*60)
+    """Runs the seven-step procurement cycle.
 
-        self.redis = RedisMemory()
-        self.sqlite = SQLiteMemory()
+    Every step is dispatched as a message on the priority bus and routed to an
+    agent by task type, so the bus history is a complete audit trail of the run.
+    """
+
+    def __init__(self, offline: Optional[bool] = None,
+                 allow_memory_fallback: bool = False, quiet: bool = False,
+                 db_path: Optional[str] = None):
+        self.quiet = quiet
+        self.offline = OFFLINE_MODE or not GEMINI_API_KEY if offline is None else offline
+
+        self._banner("SUPPLY CHAIN AUTONOMOUS INTELLIGENCE NETWORK", "Initializing...")
+
+        self.redis = RedisMemory(allow_fallback=allow_memory_fallback)
+        self.sqlite = SQLiteMemory(db_path) if db_path else SQLiteMemory()
         self.bus = MessageBus()
         self.router = TaskRouter()
 
+        self.sku_ids = list_sku_ids()
+        self.supplier_ids = list_supplier_ids()
         self._init_agents()
-        print("  All agents initialized.\n")
+
+        self._print(f"  Mode: {self.mode} | memory: {self.redis.backend} | "
+                    f"{len(self.sku_ids)} SKUs, {len(self.supplier_ids)} suppliers")
+        self._print("  All agents initialized.\n")
+
+    @property
+    def mode(self) -> str:
+        return "offline (deterministic engines)" if self.offline else "gemini"
 
     def _init_agents(self):
         self.agents = {
-            "demand_forecasting": DemandForecastingAgent(self.redis, self.sqlite),
-            "inventory": InventoryAgent(self.redis, self.sqlite),
-            "procurement": ProcurementAgent(self.redis, self.sqlite),
-            "negotiation": NegotiationAgent(self.redis, self.sqlite),
-            "logistics": LogisticsAgent(self.redis, self.sqlite),
-            "supplier_performance": SupplierPerformanceAgent(self.redis, self.sqlite),
-            "risk": RiskAgent(self.redis, self.sqlite),
+            name: cls(self.redis, self.sqlite, offline=self.offline)
+            for name, cls in AGENT_CLASSES.items()
         }
 
-    def _run_agent(self, agent_name: str, task: dict) -> dict:
-        agent = self.agents.get(agent_name)
-        if not agent:
-            return {"error": f"Agent {agent_name} not found"}
-        try:
-            return agent.run(task)
-        except Exception as e:
-            logger.error(f"Agent {agent_name} failed: {e}")
-            return {"error": str(e), "agent": agent_name}
+    # ── output helpers ───────────────────────────────────────
+    def _print(self, msg: str = "") -> None:
+        if not self.quiet:
+            print(msg)
 
-    def _update_cycle_state(self, step: str, data: Any = None):
+    def _banner(self, *lines: str) -> None:
+        self._print("\n" + "=" * 60)
+        for line in lines:
+            self._print(f"  {line}")
+        self._print("=" * 60)
+
+    def _step(self, index: int, title: str) -> None:
+        self._print(f"\n[STEP {index}/7] {title}")
+        self._print("-" * 40)
+
+    # ── dispatch ─────────────────────────────────────────────
+    async def _dispatch(self, task_type: str, payload: dict) -> dict:
+        """Publish a task, pull it off the bus, route it, and run the agent."""
+        message = self.router.build_message(
+            task_type, payload, priority=TASK_PRIORITIES.get(task_type, 3)
+        )
+        await self.bus.publish(message)
+        queued = await self.bus.consume(timeout=5.0)
+        if queued is None:
+            logger.error("Task %s was published but never delivered", task_type)
+            return {"error": f"Task {task_type} was not delivered", "agent": message.to_agent}
+
+        agent = self.agents.get(queued.to_agent)
+        if agent is None:
+            return {"error": f"Agent {queued.to_agent} not found", "agent": queued.to_agent}
+
+        loop = asyncio.get_running_loop()
+        try:
+            # Agents are blocking (network + SQLite), so keep the loop free.
+            result = await loop.run_in_executor(None, agent.run, queued.payload)
+        except Exception as e:
+            logger.exception("Agent %s failed", queued.to_agent)
+            self._print(f"  ! {queued.to_agent} failed: {e}")
+            result = {"error": str(e), "agent": queued.to_agent}
+
+        await self.bus.publish(self.router.build_result(queued, result))
+        await self.bus.consume(timeout=1.0)
+        self._update_cycle_state(task_type, result)
+        return result
+
+    def _update_cycle_state(self, step: str, data: Any = None) -> None:
         self.redis.hset(RedisMemory.cycle_state_key(), step, {
-            "status": "completed",
+            "status": "failed" if isinstance(data, dict) and data.get("error") else "completed",
             "timestamp": datetime.utcnow().isoformat(),
             "summary": str(data)[:200] if data else ""
         })
 
-    def run_cycle(self) -> dict:
-        cycle_start = datetime.utcnow()
-        print(f"\n{'='*60}")
-        print(f"  CYCLE START: {cycle_start.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        print(f"{'='*60}\n")
+    # ── cycle ────────────────────────────────────────────────
+    def run_cycle(self, sku_ids: Optional[list] = None) -> dict:
+        """Synchronous entry point — runs the async cycle to completion."""
+        return asyncio.run(self.run_cycle_async(sku_ids))
 
-        self.redis.set(RedisMemory.cycle_state_key(), {"status": "running", "started_at": cycle_start.isoformat()})
+    async def run_cycle_async(self, sku_ids: Optional[list] = None) -> dict:
+        sku_ids = sku_ids or self.sku_ids
+        cycle_start = datetime.utcnow()
+        cycle_id = cycle_start.strftime("%Y%m%d%H%M%S")
+        self._banner(f"CYCLE START: {cycle_start.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                     f"Cycle {cycle_id} | mode: {self.mode}")
+
+        # cycle_state is a hash — clear the previous run before writing this one.
+        self.redis.delete(RedisMemory.cycle_state_key())
+        self.redis.set_hash(RedisMemory.cycle_state_key(),
+                            {"status": "running", "cycle_id": cycle_id,
+                             "started_at": cycle_start.isoformat()})
 
         # --- STEP 1: Inventory Check ---
-        print("\n[STEP 1/7] INVENTORY MONITORING")
-        print("-" * 40)
-        inventory_result = self._run_agent("inventory", {})
-        alerts = inventory_result.get("alerts", [])
-        reorder_needed = inventory_result.get("reorder_needed", alerts)
-        self._update_cycle_state("inventory", inventory_result.get("inventory_status"))
-        print(f"  Status: {inventory_result.get('inventory_status', 'unknown')} | Alerts: {len(alerts)}")
+        self._step(1, "INVENTORY MONITORING")
+        inventory_result = await self._dispatch("check_inventory", {})
+        reorder_needed = inventory_result.get("reorder_needed") or inventory_result.get("alerts", [])
+        self._print(f"  Status: {inventory_result.get('inventory_status', 'unknown')} | "
+                    f"Reorder candidates: {len(reorder_needed)}")
 
         # --- STEP 2: Demand Forecasting ---
-        print("\n[STEP 2/7] DEMAND FORECASTING")
-        print("-" * 40)
-        forecast_result = self._run_agent("demand_forecasting", {"sku_ids": ALL_SKUS})
+        self._step(2, "DEMAND FORECASTING")
+        forecast_result = await self._dispatch("forecast_demand", {"sku_ids": sku_ids})
         forecasts = forecast_result.get("forecasts", [])
-        self._update_cycle_state("forecasting", f"{len(forecasts)} forecasts")
-        print(f"  Forecasts generated: {len(forecasts)}")
+        self._print(f"  Forecasts generated: {len(forecasts)}")
 
         # --- STEP 3: Procurement Decisions ---
-        print("\n[STEP 3/7] PROCUREMENT DECISIONS")
-        print("-" * 40)
-        procurement_result = self._run_agent("procurement", {
+        self._step(3, "PROCUREMENT DECISIONS")
+        procurement_result = await self._dispatch("create_procurement", {
             "inventory_alerts": reorder_needed,
-            "forecasts": forecasts
+            "forecasts": forecasts,
         })
         decisions = procurement_result.get("decisions", [])
-        self._update_cycle_state("procurement", f"{len(decisions)} POs")
-        print(f"  Purchase orders created: {len(decisions)}")
-        for d in decisions:
-            print(f"    PO {d.get('po_number','?')}: {d.get('sku_id')} x{d.get('order_quantity')} from {d.get('selected_supplier_name','?')}")
+        self._print(f"  Purchase orders created: {len(decisions)}")
 
         # --- STEP 4: Negotiation ---
-        print("\n[STEP 4/7] PRICE NEGOTIATION")
-        print("-" * 40)
-        negotiation_results = []
+        self._step(4, "PRICE NEGOTIATION")
+        negotiations = {}
         for decision in decisions:
-            if decision.get("action") == "create_po" or decision.get("po_number"):
-                neg_result = self._run_agent("negotiation", {
-                    "po_number": decision.get("po_number", "UNKNOWN"),
-                    "supplier_id": decision.get("selected_supplier_id"),
-                    "sku_id": decision.get("sku_id"),
-                    "quantity": decision.get("order_quantity", 0),
-                    "target_price": decision.get("target_price", 0.0)
-                })
-                negotiation_results.append(neg_result)
-                outcome = neg_result.get("outcome", "unknown")
-                discount = neg_result.get("discount_achieved_pct", 0)
-                print(f"    {decision.get('po_number','?')}: {outcome} | discount={discount:.1f}%")
-        self._update_cycle_state("negotiation", f"{len(negotiation_results)} negotiations")
+            po_number = decision.get("po_number")
+            if not po_number:
+                continue
+            result = await self._dispatch("negotiate_po", {
+                "po_number": po_number,
+                "supplier_id": decision.get("selected_supplier_id"),
+                "sku_id": decision.get("sku_id"),
+                "quantity": decision.get("order_quantity", 0),
+                "target_price": decision.get("target_price", 0.0),
+            })
+            negotiations[po_number] = result
+            self._print(f"    {po_number}: {result.get('outcome', 'unknown')} | "
+                        f"discount={float(result.get('discount_achieved_pct', 0) or 0):.1f}%")
+        if not decisions:
+            self._print("  No purchase orders to negotiate.")
 
         # --- STEP 5: Logistics Assignment ---
-        print("\n[STEP 5/7] LOGISTICS ASSIGNMENT")
-        print("-" * 40)
-        negotiated_pos = []
-        for d, n in zip(decisions, negotiation_results):
-            if n.get("outcome") != "walk_away":
-                negotiated_pos.append({
-                    "po_number": d.get("po_number"),
-                    "supplier_id": d.get("selected_supplier_id"),
-                    "sku_id": d.get("sku_id"),
-                    "quantity": d.get("order_quantity"),
-                    "urgency": d.get("urgency", "normal")
-                })
+        self._step(5, "LOGISTICS ASSIGNMENT")
+        shippable = []
+        for decision in decisions:
+            po_number = decision.get("po_number")
+            negotiation = negotiations.get(po_number, {})
+            if negotiation.get("outcome") == "walk_away":
+                continue
+            shippable.append({
+                "po_number": po_number,
+                "supplier_id": decision.get("selected_supplier_id"),
+                "sku_id": decision.get("sku_id"),
+                "quantity": decision.get("order_quantity"),
+                "urgency": decision.get("urgency", "normal"),
+            })
 
-        logistics_result = self._run_agent("logistics", {"purchase_orders": negotiated_pos})
+        logistics_result = await self._dispatch("assign_logistics", {"purchase_orders": shippable})
         assignments = logistics_result.get("assignments", [])
-        self._update_cycle_state("logistics", f"{len(assignments)} routes assigned")
-        print(f"  Routes assigned: {len(assignments)}")
+        self._print(f"  Routes assigned: {len(assignments)} | "
+                    f"shipping cost: ${float(logistics_result.get('total_shipping_cost', 0) or 0):,.2f}")
 
         # --- STEP 6: Supplier Scoring ---
-        print("\n[STEP 6/7] SUPPLIER PERFORMANCE SCORING")
-        print("-" * 40)
-        po_outcomes = []
-        for n in negotiation_results:
-            po_outcomes.append({
-                "po_number": n.get("po_number"),
-                "supplier_id": n.get("supplier_id"),
-                "outcome": n.get("outcome"),
-                "discount_pct": n.get("discount_achieved_pct", 0)
-            })
-        scoring_result = self._run_agent("supplier_performance", {
-            "supplier_ids": ALL_SUPPLIERS,
-            "po_outcomes": po_outcomes
+        self._step(6, "SUPPLIER PERFORMANCE SCORING")
+        po_outcomes = [{
+            "po_number": po_number,
+            "supplier_id": n.get("supplier_id"),
+            "outcome": n.get("outcome"),
+            "discount_pct": n.get("discount_achieved_pct", 0),
+        } for po_number, n in negotiations.items()]
+        scoring_result = await self._dispatch("score_suppliers", {
+            "supplier_ids": self.supplier_ids,
+            "po_outcomes": po_outcomes,
         })
         scores = scoring_result.get("scores", [])
-        self._update_cycle_state("supplier_scoring", f"{len(scores)} suppliers scored")
-        print(f"  Suppliers scored: {len(scores)}")
+        self._print(f"  Suppliers scored: {len(scores)} | "
+                    f"network avg: {float(scoring_result.get('avg_network_score', 0) or 0):.2f}")
 
         # --- STEP 7: Risk Assessment ---
-        print("\n[STEP 7/7] RISK & RESILIENCE ASSESSMENT")
-        print("-" * 40)
-        all_pos = self.sqlite.get_all_purchase_orders()
-        active_pos = [p for p in all_pos if p["status"] in ("pending", "negotiated", "in_transit")]
-        risk_result = self._run_agent("risk", {
-            "active_pos": active_pos[:10],
-            "supplier_scores": scores
+        self._step(7, "RISK & RESILIENCE ASSESSMENT")
+        open_pos = self.sqlite.get_open_purchase_orders()
+        risk_result = await self._dispatch("assess_risk", {
+            "active_pos": open_pos[:20],
+            "supplier_scores": scores,
         })
         risks = risk_result.get("risks", [])
-        self._update_cycle_state("risk", f"{len(risks)} risks identified")
+        self._print(f"  Risk level: {risk_result.get('overall_risk_level', 'unknown')} | "
+                    f"{len(risks)} risks identified")
 
-        # --- FINAL SUMMARY ---
+        summary = self._build_summary(
+            cycle_id, cycle_start, inventory_result, forecasts, decisions,
+            negotiations, logistics_result, scoring_result, risk_result
+        )
+
+        self.redis.set_hash(RedisMemory.cycle_state_key(),
+                            {"status": "completed", "cycle_id": cycle_id, "summary": summary})
+        self.sqlite.save_cycle_run(
+            cycle_id=cycle_id,
+            started_at=summary["started_at"],
+            completed_at=summary["completed_at"],
+            duration_seconds=summary["duration_seconds"],
+            mode=summary["mode"],
+            pos_created=len(decisions),
+            risks_found=len(risks),
+            summary=summary,
+        )
+
+        self._banner("CYCLE COMPLETE")
+        self._print(json.dumps(summary, indent=2))
+        self._print("=" * 60)
+        return summary
+
+    def _build_summary(self, cycle_id, cycle_start, inventory_result, forecasts,
+                       decisions, negotiations, logistics_result, scoring_result,
+                       risk_result) -> dict:
         cycle_end = datetime.utcnow()
-        duration = (cycle_end - cycle_start).total_seconds()
+        negotiation_results = list(negotiations.values())
+        deals = [n for n in negotiation_results if n.get("outcome") == "deal_accepted"]
+        walked = [n for n in negotiation_results if n.get("outcome") == "walk_away"]
+        scores = scoring_result.get("scores", [])
+        risks = risk_result.get("risks", [])
+        status_counts = self.sqlite.get_po_status_counts()
 
-        all_scores = self.sqlite.get_all_supplier_scores()
-        total_po_value = sum(p.get("total_value", 0) for p in self.sqlite.get_all_purchase_orders()
-                             if p["status"] != "cancelled")
-
-        summary = {
-            "cycle_id": cycle_start.strftime("%Y%m%d%H%M%S"),
+        return {
+            "cycle_id": cycle_id,
+            "mode": "offline" if self.offline else "gemini",
             "started_at": cycle_start.isoformat(),
             "completed_at": cycle_end.isoformat(),
-            "duration_seconds": round(duration, 1),
+            "duration_seconds": round((cycle_end - cycle_start).total_seconds(), 1),
             "steps_completed": 7,
             "inventory": {
                 "status": inventory_result.get("inventory_status", "unknown"),
-                "alerts": len(alerts),
-                "skus_monitored": inventory_result.get("total_skus_monitored", 10)
+                "alerts": len(inventory_result.get("alerts", [])),
+                "skus_monitored": inventory_result.get("total_skus_monitored", len(self.sku_ids)),
+                "stock_value_usd": inventory_result.get("total_inventory_value_usd", 0),
             },
-            "forecasting": {
-                "skus_forecasted": len(forecasts)
-            },
+            "forecasting": {"skus_forecasted": len(forecasts)},
             "procurement": {
                 "pos_created": len(decisions),
-                "total_value_usd": sum(d.get("total_estimated_value", 0) for d in decisions)
+                "total_value_usd": round(
+                    sum(float(d.get("total_estimated_value", 0) or 0) for d in decisions), 2),
             },
             "negotiation": {
-                "deals_completed": len([n for n in negotiation_results if n.get("outcome") == "deal_accepted"]),
-                "deals_walked": len([n for n in negotiation_results if n.get("outcome") == "walk_away"]),
+                "deals_completed": len(deals),
+                "deals_walked": len(walked),
                 "avg_discount_pct": round(
-                    sum(n.get("discount_achieved_pct", 0) for n in negotiation_results) /
-                    max(len(negotiation_results), 1), 2
-                )
+                    sum(float(n.get("discount_achieved_pct", 0) or 0) for n in negotiation_results)
+                    / max(len(negotiation_results), 1), 2),
+                "savings_vs_list_usd": round(
+                    sum(float(n.get("savings_vs_list", 0) or 0) for n in deals), 2),
             },
             "logistics": {
-                "routes_assigned": len(assignments)
+                "routes_assigned": len(logistics_result.get("assignments", [])),
+                "shipping_cost_usd": logistics_result.get("total_shipping_cost", 0.0),
+                "avg_transit_days": logistics_result.get("avg_transit_days", 0.0),
             },
             "supplier_performance": {
                 "suppliers_scored": len(scores),
                 "preferred": len([s for s in scores if s.get("tier") == "preferred"]),
-                "at_risk": len([s for s in scores if s.get("tier") == "at_risk"])
+                "at_risk": len([s for s in scores if s.get("tier") == "at_risk"]),
+                "avg_network_score": scoring_result.get("avg_network_score", 0.0),
             },
             "risk": {
                 "total_risks": len(risks),
                 "critical": len([r for r in risks if r.get("severity", 0) >= 4]),
                 "high": len([r for r in risks if r.get("severity", 0) == 3]),
-                "overall_level": risk_result.get("overall_risk_level", "unknown")
+                "overall_level": risk_result.get("overall_risk_level", "unknown"),
+                "risk_score": risk_result.get("risk_score", 0.0),
             },
             "database": {
-                "total_pos": len(self.sqlite.get_all_purchase_orders()),
-                "total_value_usd": round(total_po_value, 2),
-                "supplier_scores_saved": len(all_scores)
-            }
+                "po_status_counts": status_counts,
+                "total_pos": sum(s["count"] for s in status_counts.values()),
+                "total_value_usd": round(
+                    sum(s["value"] for status, s in status_counts.items()
+                        if status != "cancelled"), 2),
+                "supplier_scores_saved": len(self.sqlite.get_all_supplier_scores()),
+            },
+            "messages_on_bus": len(self.bus.get_history()),
         }
-
-        print(f"\n{'='*60}")
-        print("  CYCLE COMPLETE")
-        print(f"{'='*60}")
-        print(json.dumps(summary, indent=2))
-        print("="*60)
-
-        return summary

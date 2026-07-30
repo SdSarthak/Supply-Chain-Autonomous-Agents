@@ -1,14 +1,29 @@
 import json
 import random
-import uuid
 from datetime import datetime, timedelta
-from typing import Optional
 from config import SUPPLIERS_FILE
 
 
 def _load_suppliers() -> list[dict]:
     with open(SUPPLIERS_FILE) as f:
         return json.load(f)
+
+
+def list_supplier_ids() -> list[str]:
+    """Every supplier id in the vendor master data, in file order."""
+    return [s["supplier_id"] for s in _load_suppliers()]
+
+
+def get_tier_price(pricing: dict, quantity: int) -> float:
+    """Resolve the volume-tier unit price for a quantity from a pricing block."""
+    list_price = pricing.get("list_price", 0.0)
+    tier3_qty = pricing.get("tier3_qty")
+    tier2_qty = pricing.get("tier2_qty")
+    if tier3_qty is not None and quantity >= tier3_qty:
+        return pricing.get("tier3_price", list_price)
+    if tier2_qty is not None and quantity >= tier2_qty:
+        return pricing.get("tier2_price", list_price)
+    return list_price
 
 
 def get_qualified_suppliers(sku_id: str) -> dict:
@@ -56,13 +71,7 @@ def get_supplier_offer(supplier_id: str, sku_id: str, quantity: int) -> dict:
 
     pricing = supplier["pricing"].get(sku_id, {})
     list_price = pricing.get("list_price", 0.0)
-
-    if quantity >= pricing.get("tier3_qty", float("inf")):
-        base_price = pricing.get("tier3_price", list_price)
-    elif quantity >= pricing.get("tier2_qty", float("inf")):
-        base_price = pricing.get("tier2_price", list_price)
-    else:
-        base_price = list_price
+    base_price = get_tier_price(pricing, quantity)
 
     # Simulate supplier counter-offer with slight randomness
     counter_multiplier = random.uniform(0.97, 1.03)
@@ -74,6 +83,7 @@ def get_supplier_offer(supplier_id: str, sku_id: str, quantity: int) -> dict:
         "sku_id": sku_id,
         "quantity": quantity,
         "list_price": list_price,
+        "tier_price": base_price,
         "offered_price": counter_price,
         "lead_time_days": supplier["lead_time_days"],
         "payment_terms": supplier["payment_terms"],
@@ -119,16 +129,40 @@ def get_alternative_supplier(sku_id: str, exclude_supplier_id: str) -> dict:
     }
 
 
+SUPPLIER_PRICE_FLOOR_PCT = 0.88
+SUPPLIER_CONCESSION_PER_ROUND = 0.02
+
+
 def simulate_supplier_counter_offer(current_offer: float, round_num: int,
-                                     list_price: float) -> dict:
-    # Supplier concedes ~2-3% per round but never goes below 88% of list price
-    floor = list_price * 0.88
-    concession = current_offer * (1 - random.uniform(0.015, 0.03))
-    counter = max(floor, round(concession, 2))
-    accepted = counter <= current_offer
+                                     list_price: float,
+                                     floor_price: float = None) -> dict:
+    """Simulate how a supplier responds to our price proposal.
+
+    `list_price` is the price the supplier is anchored on for this deal — their
+    opening quote. They hold a floor at `floor_price`, defaulting to 88% of that
+    anchor. Anything at or above the floor is accepted outright; below it they
+    counter, conceding ~2-3% of the anchor per round without crossing the floor.
+    """
+    current_offer = float(current_offer)
+    list_price = float(list_price)
+    round_num = max(1, int(round_num))
+    floor = round(float(floor_price) if floor_price else list_price * SUPPLIER_PRICE_FLOOR_PCT, 2)
+
+    if current_offer >= floor:
+        return {
+            "counter_price": round(current_offer, 2),
+            "accepted": True,
+            "round": round_num,
+            "floor_price": floor,
+            "message": "We accept your offer."
+        }
+
+    concession = SUPPLIER_CONCESSION_PER_ROUND * round_num + random.uniform(0.005, 0.015)
+    counter = max(floor, round(list_price * (1 - concession), 2))
     return {
         "counter_price": counter,
-        "accepted": accepted,
+        "accepted": False,
         "round": round_num,
-        "message": "We can offer this price given the volume." if not accepted else "We accept your offer."
+        "floor_price": floor,
+        "message": "That is below our cost base — this is the best we can do at this volume."
     }

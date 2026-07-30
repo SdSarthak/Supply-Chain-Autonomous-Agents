@@ -1,12 +1,15 @@
 """
 Stress tests for Supply Chain Autonomous Intelligence Network.
-Tests all tools, memory layers, data integrity, concurrency, and edge cases.
-Does NOT require a real Gemini API key or Redis — tests the full non-LLM stack.
+Tests all tools, memory layers, agent engines, the full offline cycle, data
+integrity, concurrency, and edge cases.
+Does NOT require a Gemini API key or a running Redis — covers the whole
+non-LLM stack plus every agent's deterministic engine.
 """
 
 import sys
 import os
 import json
+import shutil
 import time
 import random
 import threading
@@ -19,6 +22,9 @@ PASS = 0
 FAIL = 0
 ERRORS = []
 
+INVENTORY_FILE = os.path.join("data", "inventory.json")
+INVENTORY_BACKUP = os.path.join("data", "inventory.json.testbak")
+
 
 def test(name, fn):
     global PASS, FAIL
@@ -30,6 +36,25 @@ def test(name, fn):
         print(f"  [FAIL] {name}: {e}")
         ERRORS.append((name, traceback.format_exc()))
         FAIL += 1
+
+
+def protect_inventory_file(fn):
+    """Some tool tests write to data/inventory.json — restore it afterwards."""
+    def wrapper():
+        shutil.copyfile(INVENTORY_FILE, INVENTORY_BACKUP)
+        try:
+            fn()
+        finally:
+            shutil.move(INVENTORY_BACKUP, INVENTORY_FILE)
+    return wrapper
+
+
+def temp_db(name):
+    """Remove a SQLite file and its WAL sidecars."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = name + suffix
+        if os.path.exists(path):
+            os.remove(path)
 
 
 # ─────────────────────────────────────────
@@ -115,6 +140,7 @@ def suite_data_integrity():
 # ─────────────────────────────────────────
 # TOOL FUNCTION TESTS
 # ─────────────────────────────────────────
+@protect_inventory_file
 def suite_tools():
     print("\n=== TOOL FUNCTIONS ===")
     from tools.inventory_tools import (get_all_inventory, get_inventory_by_sku,
@@ -309,6 +335,85 @@ def suite_tools():
                                     "customs_clearance", "out_for_delivery", "delivered"]
             assert "estimated_arrival" in r
     test("track_shipment: 3 different POs, valid statuses", test_shipment_tracking)
+
+    def test_shipment_tracking_stable():
+        first = track_shipment("PO-20260404-DDDD")
+        second = track_shipment("PO-20260404-DDDD")
+        assert first["status"] == second["status"]
+        assert first["carrier_tracking_id"] == second["carrier_tracking_id"]
+        # The global RNG must be untouched by tracking.
+        random.seed(7)
+        expected = random.random()
+        random.seed(7)
+        track_shipment("PO-20260404-DDDD")
+        assert random.random() == expected, "track_shipment reseeded the global RNG"
+    test("track_shipment: stable per PO and leaves global RNG alone", test_shipment_tracking_stable)
+
+    def test_update_stock_keeps_invariant():
+        from tools.inventory_tools import get_inventory_by_sku as get_inv
+        update_stock("SKU-003", "WH-EAST", -999999)
+        with open(INVENTORY_FILE) as f:
+            records = json.load(f)
+        row = next(r for r in records
+                   if r["sku_id"] == "SKU-003" and r["location"] == "WH-EAST")
+        assert row["on_hand"] == 0
+        assert row["reserved"] <= row["on_hand"]
+        assert row["available"] == row["on_hand"] - row["reserved"]
+    test("update_stock: clamping to 0 keeps available = on_hand - reserved",
+         test_update_stock_keeps_invariant)
+
+    def test_list_sku_ids():
+        from tools.inventory_tools import list_sku_ids
+        from tools.vendor_tools import list_supplier_ids
+        skus = list_sku_ids()
+        assert len(skus) == 10 and len(set(skus)) == 10
+        assert len(list_supplier_ids()) == 8
+    test("list_sku_ids / list_supplier_ids: master data enumerated once each",
+         test_list_sku_ids)
+
+    def test_demand_history_aggregates():
+        r = get_demand_history("SKU-004", days=180)
+        assert r["days_analyzed"] == 180
+        assert len(r["records"]) <= 30, "raw records should be truncated"
+        assert r["records_truncated"] is True
+        assert sum(w["units_sold"] for w in r["weekly_totals"]) == r["total_sold"]
+        assert sum(r["regional_split"].values()) == r["total_sold"]
+        assert r["min_daily"] <= r["avg_daily_demand"] <= r["max_daily"]
+    test("get_demand_history: weekly/regional aggregates reconcile with total",
+         test_demand_history_aggregates)
+
+    def test_tier_price_resolution():
+        from tools.vendor_tools import get_tier_price
+        pricing = {"list_price": 100.0, "tier2_qty": 50, "tier2_price": 90.0,
+                   "tier3_qty": 200, "tier3_price": 80.0}
+        assert get_tier_price(pricing, 10) == 100.0
+        assert get_tier_price(pricing, 50) == 90.0
+        assert get_tier_price(pricing, 199) == 90.0
+        assert get_tier_price(pricing, 200) == 80.0
+        assert get_tier_price({"list_price": 5.0}, 10_000) == 5.0
+    test("get_tier_price: volume tiers resolve at every boundary", test_tier_price_resolution)
+
+    def test_counter_offer_floor_override():
+        from tools.vendor_tools import simulate_supplier_counter_offer as counter
+        accepted = counter(current_offer=90.0, round_num=1, list_price=100.0, floor_price=90.0)
+        assert accepted["accepted"] is True and accepted["counter_price"] == 90.0
+        rejected = counter(current_offer=70.0, round_num=1, list_price=100.0, floor_price=85.0)
+        assert rejected["accepted"] is False
+        assert rejected["counter_price"] >= 85.0
+        assert rejected["counter_price"] <= 100.0
+    test("simulate_supplier_counter_offer: explicit floor accepted/countered correctly",
+         test_counter_offer_floor_override)
+
+    def test_select_route_for_region():
+        from tools.logistics_tools import select_route_for_region
+        fast = select_route_for_region("APAC", "critical")
+        cheap = select_route_for_region("APAC", "low")
+        assert "error" not in fast and "error" not in cheap
+        assert fast["selected_route"]["transit_days"] <= cheap["selected_route"]["transit_days"]
+        assert cheap["selected_route"]["cost_per_unit"] <= fast["selected_route"]["cost_per_unit"]
+        assert "error" in select_route_for_region("ANTARCTICA", "normal")
+    test("select_route_for_region: urgency changes the selected route",
+         test_select_route_for_region)
 
 
 # ─────────────────────────────────────────
@@ -626,6 +731,451 @@ def suite_orchestrator():
 
 
 # ─────────────────────────────────────────
+# IN-MEMORY STORE (Redis fallback)
+# ─────────────────────────────────────────
+def suite_memory_fallback():
+    print("\n=== IN-MEMORY STORE (REDIS FALLBACK) ===")
+    from memory.redis_memory import RedisMemory, InMemoryStore
+
+    def build():
+        return RedisMemory(client=InMemoryStore())
+
+    def test_backend_flag():
+        mem = build()
+        assert mem.backend == "in-memory"
+        assert mem.ping() is True
+    test("fallback: reports in-memory backend and pings", test_backend_flag)
+
+    def test_json_roundtrip_and_ttl():
+        mem = build()
+        mem.set("k", {"a": [1, 2, 3]})
+        assert mem.get("k") == {"a": [1, 2, 3]}
+        mem.set("t", "gone", ttl=1)
+        assert mem.get("t") == "gone"
+        time.sleep(1.05)
+        assert mem.get("t") is None
+        mem.delete("k")
+        assert mem.get("k") is None
+    test("fallback: set/get/delete and TTL expiry", test_json_roundtrip_and_ttl)
+
+    def test_list_window():
+        mem = build()
+        for i in range(25):
+            mem.append_to_list("hist", {"turn": i}, max_len=20)
+        items = mem.get_list("hist")
+        assert len(items) == 20
+        assert items[0]["turn"] == 5 and items[-1]["turn"] == 24
+    test("fallback: list sliding window matches Redis LTRIM semantics", test_list_window)
+
+    def test_hash_ops():
+        mem = build()
+        mem.set_hash("h", {"a": 1, "b": {"nested": True}})
+        mem.hset("h", "c", [1, 2])
+        assert mem.get_hash("h") == {"a": 1, "b": {"nested": True}, "c": [1, 2]}
+        assert mem.hget("h", "b") == {"nested": True}
+        assert mem.hget("h", "missing") is None
+    test("fallback: hash set/get with nested values", test_hash_ops)
+
+    def test_type_enforcement():
+        mem = build()
+        mem.set("mixed", "a string")
+        try:
+            mem.hset("mixed", "field", 1)
+            assert False, "should refuse a hash write over a string key"
+        except TypeError:
+            pass
+    test("fallback: refuses hash writes to a string key (Redis WRONGTYPE parity)",
+         test_type_enforcement)
+
+    def test_concurrent_access():
+        mem = build()
+        errors = []
+
+        def worker(tid):
+            try:
+                for i in range(50):
+                    mem.set(f"c:{tid}:{i}", {"tid": tid, "i": i})
+                    assert mem.get(f"c:{tid}:{i}")["tid"] == tid
+                    mem.append_to_list("shared", {"tid": tid}, max_len=100)
+            except Exception as e:
+                errors.append(str(e))
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors, f"concurrent errors: {errors}"
+        assert len(mem.get_list("shared")) == 100
+    test("fallback: 8 threads x 50 writes stay consistent", test_concurrent_access)
+
+
+# ─────────────────────────────────────────
+# AGENT PLUMBING
+# ─────────────────────────────────────────
+def suite_agent_plumbing():
+    print("\n=== AGENT PLUMBING ===")
+    from agents.base_agent import extract_json, is_retryable, BaseAgent
+
+    def test_extract_plain_json():
+        assert extract_json('{"a": 1}') == {"a": 1}
+        assert extract_json('  {"a": {"b": [1,2]}}  ') == {"a": {"b": [1, 2]}}
+    test("extract_json: plain and nested objects", test_extract_plain_json)
+
+    def test_extract_fenced_json():
+        text = 'Here you go:\n```json\n{"forecasts": [{"sku_id": "SKU-001"}]}\n```\nDone.'
+        assert extract_json(text)["forecasts"][0]["sku_id"] == "SKU-001"
+    test("extract_json: ```json fenced block with surrounding prose", test_extract_fenced_json)
+
+    def test_extract_with_trailing_prose():
+        text = '{"risks": [{"severity": 4}]} — note that severity 4 needs action.'
+        assert extract_json(text)["risks"][0]["severity"] == 4
+    test("extract_json: stops at the closing brace, ignores trailing prose",
+         test_extract_with_trailing_prose)
+
+    def test_extract_braces_in_strings():
+        text = '{"description": "uses } and { inside", "n": 2}'
+        assert extract_json(text)["n"] == 2
+    test("extract_json: braces inside strings do not end the object",
+         test_extract_braces_in_strings)
+
+    def test_extract_failures():
+        assert extract_json("") == {}
+        assert extract_json("no json here") == {}
+        assert extract_json('{"broken": ') == {}
+        assert extract_json('[1, 2, 3]') == {}
+    test("extract_json: empty/invalid/array input returns {}", test_extract_failures)
+
+    def test_retryable_classification():
+        assert is_retryable(Exception("429 Resource has been exhausted")) is True
+        assert is_retryable(Exception("503 Service Unavailable")) is True
+        assert is_retryable(ValueError("invalid api key")) is False
+    test("is_retryable: rate limits and 5xx retry, auth errors do not",
+         test_retryable_classification)
+
+    def test_history_sanitization():
+        raw = [
+            {"role": "model", "parts": [{"text": "orphan model turn"}]},
+            {"role": "user", "parts": [{"text": "hello"}]},
+            {"role": "model", "parts": [{"text": "hi"}]},
+            {"role": "user", "parts": [{"text": ""}]},
+            {"role": "user", "parts": [{"text": "dangling"}]},
+        ]
+        clean = BaseAgent._sanitize_history(raw)
+        assert [t["role"] for t in clean] == ["user", "model"]
+        assert clean[0]["parts"][0]["text"] == "hello"
+        assert BaseAgent._sanitize_history([]) == []
+        assert BaseAgent._sanitize_history(["garbage", None]) == []
+    test("BaseAgent._sanitize_history: drops orphans, empties and dangling turns",
+         test_history_sanitization)
+
+    def test_tool_dispatch():
+        from agents.inventory_agent import InventoryAgent
+        from memory.redis_memory import RedisMemory, InMemoryStore
+        from memory.sqlite_memory import SQLiteMemory
+        temp_db("test_dispatch.db")
+        agent = InventoryAgent(RedisMemory(client=InMemoryStore()),
+                               SQLiteMemory("test_dispatch.db"), offline=True)
+        ok = agent._dispatch_tool("get_inventory_by_sku", {"sku_id": "SKU-001"})
+        assert ok["sku_id"] == "SKU-001"
+        assert "error" in agent._dispatch_tool("not_a_tool", {})
+        assert "error" in agent._dispatch_tool("get_inventory_by_sku", {"wrong_arg": 1})
+        assert "error" in agent._dispatch_tool("get_inventory_by_sku", {"sku_id": "SKU-999"})
+        temp_db("test_dispatch.db")
+    test("BaseAgent._dispatch_tool: unknown tool, bad args and tool errors are handled",
+         test_tool_dispatch)
+
+    def test_declarations_match_implementations():
+        from memory.redis_memory import RedisMemory, InMemoryStore
+        from memory.sqlite_memory import SQLiteMemory
+        from orchestrator.orchestrator import AGENT_CLASSES
+        temp_db("test_decl.db")
+        redis_mem = RedisMemory(client=InMemoryStore())
+        db = SQLiteMemory("test_decl.db")
+        for name, cls in AGENT_CLASSES.items():
+            agent = cls(redis_mem, db, offline=True)
+            for declaration in agent._tool_declarations:
+                assert declaration.name in agent._tools, \
+                    f"{name} declares {declaration.name} with no implementation"
+            assert agent._offline_result is not None
+        temp_db("test_decl.db")
+    test("agents: every declared Gemini tool has a registered implementation",
+         test_declarations_match_implementations)
+
+
+# ─────────────────────────────────────────
+# AGENT DECISION ENGINES (offline)
+# ─────────────────────────────────────────
+@protect_inventory_file
+def suite_agent_engines():
+    print("\n=== AGENT DECISION ENGINES (OFFLINE) ===")
+    from memory.redis_memory import RedisMemory, InMemoryStore
+    from memory.sqlite_memory import SQLiteMemory
+    from agents.inventory_agent import InventoryAgent
+    from agents.demand_forecasting_agent import DemandForecastingAgent
+    from agents.procurement_agent import ProcurementAgent
+    from agents.negotiation_agent import NegotiationAgent
+    from agents.logistics_agent import LogisticsAgent
+    from agents.supplier_performance_agent import SupplierPerformanceAgent
+    from agents.risk_agent import RiskAgent
+
+    temp_db("test_agents.db")
+    redis_mem = RedisMemory(client=InMemoryStore())
+    db = SQLiteMemory("test_agents.db")
+
+    def build(cls):
+        return cls(redis_mem, db, offline=True)
+
+    def test_inventory_engine():
+        result = build(InventoryAgent).run({})
+        assert result["inventory_status"] in ("healthy", "warning", "critical")
+        assert result["total_skus_monitored"] == 10
+        assert result["total_inventory_value_usd"] > 0
+        assert result["iot_summary"]["sensors_checked"] == 3
+        for alert in result["reorder_needed"]:
+            assert alert["suggested_qty"] >= 0
+            assert alert["available"] <= alert["reorder_point"]
+    test("InventoryAgent: full snapshot, reorder list and IoT summary", test_inventory_engine)
+
+    def test_forecast_engine():
+        result = build(DemandForecastingAgent).run({"sku_ids": ["SKU-001", "SKU-009"]})
+        assert len(result["forecasts"]) == 2
+        for f in result["forecasts"]:
+            assert f["forecast_30d"] < f["forecast_60d"] < f["forecast_90d"]
+            assert 0.5 <= f["confidence"] <= 0.95
+            assert f["reorder_urgency"] in ("low", "medium", "high", "critical")
+        rows = db.get_forecasts("SKU-001", 60)
+        assert rows and rows[0]["horizon_days"] == 60
+    test("DemandForecastingAgent: horizons increase, saved to SQLite", test_forecast_engine)
+
+    def test_forecast_unknown_sku():
+        result = build(DemandForecastingAgent).run({"sku_ids": ["SKU-999"]})
+        assert result["forecasts"] == []
+    test("DemandForecastingAgent: unknown SKU is skipped, not crashed",
+         test_forecast_unknown_sku)
+
+    def test_procurement_engine():
+        alerts = [{"sku_id": "SKU-005", "urgency": "critical"}]
+        result = build(ProcurementAgent).run({"inventory_alerts": alerts, "forecasts": []})
+        decisions = result["decisions"]
+        assert len(decisions) == 1
+        d = decisions[0]
+        assert d["sku_id"] == "SKU-005"
+        assert d["order_quantity"] > 0
+        assert d["po_number"].startswith("PO-")
+        assert d["target_price"] > 0
+        po = db.get_purchase_order(d["po_number"])
+        assert po["status"] == "pending"
+        assert po["total_value"] == round(d["order_quantity"] * d["target_price"], 2)
+    test("ProcurementAgent: selects a supplier and writes the PO", test_procurement_engine)
+
+    def test_procurement_respects_capacity():
+        from tools.inventory_tools import get_inventory_by_sku
+        alerts = [{"sku_id": "SKU-009", "urgency": "critical"}]
+        result = build(ProcurementAgent).run({
+            "inventory_alerts": alerts,
+            "forecasts": [{"sku_id": "SKU-009", "forecast_30d": 999999}],
+        })
+        d = result["decisions"][0]
+        inventory = get_inventory_by_sku("SKU-009")
+        assert d["order_quantity"] <= inventory["max_stock"] - inventory["total_available"]
+    test("ProcurementAgent: order quantity capped at warehouse capacity",
+         test_procurement_respects_capacity)
+
+    def test_procurement_skips_full_stock():
+        result = build(ProcurementAgent).run({
+            "inventory_alerts": [{"sku_id": "SKU-007", "urgency": "warning"}],
+            "forecasts": [],
+        })
+        assert result["decisions"] == []
+        assert "SKU-007" in result["skus_skipped"]
+    test("ProcurementAgent: skips SKUs already above the fill target",
+         test_procurement_skips_full_stock)
+
+    def test_negotiation_engine():
+        agent = build(NegotiationAgent)
+        db.create_purchase_order("PO-NEG-TEST", "SUP-001", "SKU-001", 150, 44.0)
+        result = agent.run({"po_number": "PO-NEG-TEST", "supplier_id": "SUP-001",
+                            "sku_id": "SKU-001", "quantity": 150, "target_price": 44.0})
+        assert result["outcome"] in ("deal_accepted", "walk_away")
+        assert 1 <= result["rounds_taken"] <= 5
+        assert len(result["rounds"]) == result["rounds_taken"]
+        for r in result["rounds"]:
+            assert r["our_offer"] > 0 and r["their_offer"] > 0
+        history = db.get_negotiation_history(result["session_id"])
+        assert len(history) == result["rounds_taken"]
+        assert history[-1]["status"] == "completed"
+        po = db.get_purchase_order("PO-NEG-TEST")
+        if result["outcome"] == "deal_accepted":
+            assert po["status"] == "negotiated"
+            assert po["unit_price"] == result["final_agreed_price"]
+        else:
+            assert po["status"] == "cancelled"
+    test("NegotiationAgent: real rounds logged and PO re-priced", test_negotiation_engine)
+
+    def test_negotiation_bad_supplier():
+        result = build(NegotiationAgent).run({
+            "po_number": "PO-NEG-BAD", "supplier_id": "SUP-001",
+            "sku_id": "SKU-002", "quantity": 10, "target_price": 5.0})
+        assert result["outcome"] == "walk_away"
+        assert result["rounds"] == []
+    test("NegotiationAgent: supplier that cannot supply the SKU walks away",
+         test_negotiation_bad_supplier)
+
+    def test_logistics_engine():
+        db.create_purchase_order("PO-LOG-TEST", "SUP-002", "SKU-004", 200, 56.0)
+        result = build(LogisticsAgent).run({"purchase_orders": [
+            {"po_number": "PO-LOG-TEST", "supplier_id": "SUP-002",
+             "sku_id": "SKU-004", "quantity": 200, "urgency": "critical"}
+        ]})
+        assert len(result["assignments"]) == 1
+        a = result["assignments"][0]
+        assert a["mode"] in ("air", "sea", "road")
+        assert a["shipping_cost_usd"] > 0
+        po = db.get_purchase_order("PO-LOG-TEST")
+        assert po["status"] == "in_transit"
+        assert po["route_id"] == a["selected_route_id"]
+    test("LogisticsAgent: routes a PO and flips it to in_transit", test_logistics_engine)
+
+    def test_logistics_unknown_supplier():
+        result = build(LogisticsAgent).run({"purchase_orders": [
+            {"po_number": "PO-LOG-BAD", "supplier_id": "SUP-999",
+             "sku_id": "SKU-004", "quantity": 10, "urgency": "normal"}
+        ]})
+        assert result["assignments"] == []
+        assert len(result["unassigned"]) == 1
+    test("LogisticsAgent: unknown supplier reported as unassigned",
+         test_logistics_unknown_supplier)
+
+    def test_supplier_scoring_engine():
+        result = build(SupplierPerformanceAgent).run({
+            "po_outcomes": [{"supplier_id": "SUP-008", "outcome": "walk_away"}]})
+        scores = result["scores"]
+        assert len(scores) == 8
+        overalls = [s["overall_score"] for s in scores]
+        assert overalls == sorted(overalls, reverse=True)
+        for s in scores:
+            assert 0 <= s["overall_score"] <= 1
+            assert s["tier"] in ("preferred", "approved", "conditional", "at_risk")
+            assert s["recommendation"]
+        assert db.get_supplier_score("SUP-001") is not None
+    test("SupplierPerformanceAgent: 8 suppliers scored, ranked and persisted",
+         test_supplier_scoring_engine)
+
+    def test_risk_engine():
+        result = build(RiskAgent).run({
+            "active_pos": [
+                {"po_number": "PO-R1", "supplier_id": "SUP-008", "sku_id": "SKU-002"},
+                {"po_number": "PO-R2", "supplier_id": "SUP-008", "sku_id": "SKU-004"},
+            ],
+            "supplier_scores": [{"supplier_id": "SUP-008", "tier": "conditional"}],
+        })
+        risks = result["risks"]
+        assert risks, "SUP-008 (India, 25d lead time, 0.82 reliability) must raise risks"
+        types = {r["type"] for r in risks}
+        assert "supplier_reliability" in types
+        assert "geographic" in types
+        assert "lead_time" in types
+        assert "concentration" in types
+        for r in risks:
+            assert 1 <= r["severity"] <= 4
+            assert r["mitigation"]
+        assert result["overall_risk_level"] in ("low", "medium", "high", "critical")
+        assert result["disruptions_logged"] == len([r for r in risks if r["severity"] >= 3])
+    test("RiskAgent: reliability, geographic, lead time and concentration risks",
+         test_risk_engine)
+
+    def test_risk_engine_clean_slate():
+        result = build(RiskAgent).run({"active_pos": [], "supplier_scores": []})
+        assert result["risks"] == []
+        assert result["overall_risk_level"] == "low"
+    test("RiskAgent: no active POs means no risks", test_risk_engine_clean_slate)
+
+    temp_db("test_agents.db")
+
+
+# ─────────────────────────────────────────
+# FULL CYCLE (offline, end to end)
+# ─────────────────────────────────────────
+@protect_inventory_file
+def suite_full_cycle():
+    print("\n=== FULL CYCLE (OFFLINE) ===")
+    from memory.redis_memory import InMemoryStore, RedisMemory
+    from memory.sqlite_memory import SQLiteMemory
+    from orchestrator.orchestrator import Orchestrator
+
+    temp_db("test_cycle.db")
+    orchestrator = Orchestrator(offline=True, quiet=True, db_path="test_cycle.db")
+    orchestrator.redis = RedisMemory(client=InMemoryStore())
+    orchestrator._init_agents()
+    summary = orchestrator.run_cycle()
+    db = SQLiteMemory("test_cycle.db")
+
+    def test_summary_shape():
+        for key in ("cycle_id", "mode", "duration_seconds", "inventory", "forecasting",
+                    "procurement", "negotiation", "logistics", "supplier_performance",
+                    "risk", "database"):
+            assert key in summary, f"summary missing {key}"
+        assert summary["mode"] == "offline"
+        assert summary["steps_completed"] == 7
+    test("cycle: summary contains all seven step sections", test_summary_shape)
+
+    def test_cycle_produced_work():
+        assert summary["forecasting"]["skus_forecasted"] == 10
+        assert summary["procurement"]["pos_created"] > 0, "seeded low stock must trigger POs"
+        assert summary["supplier_performance"]["suppliers_scored"] == 8
+    test("cycle: forecasts, purchase orders and supplier scores all produced",
+         test_cycle_produced_work)
+
+    def test_po_lifecycle_persisted():
+        pos = db.get_all_purchase_orders()
+        assert len(pos) == summary["procurement"]["pos_created"]
+        for po in pos:
+            assert po["status"] in ("pending", "negotiated", "in_transit", "cancelled")
+            if po["status"] == "in_transit":
+                assert po["route_id"] and po["expected_delivery"]
+    test("cycle: every PO reached a terminal state with routing data",
+         test_po_lifecycle_persisted)
+
+    def test_bus_audit_trail():
+        history = orchestrator.bus.get_history()
+        # One request + one result per dispatched task.
+        assert len(history) >= 14
+        requests = [m for m in history if m["from_agent"] == "orchestrator"]
+        results = [m for m in history if m["type"].endswith("_result")]
+        assert len(requests) == len(results)
+        for result in results:
+            assert any(r["correlation_id"] == result["correlation_id"] for r in requests)
+    test("cycle: every task on the bus has a correlated result", test_bus_audit_trail)
+
+    def test_cycle_state_in_memory():
+        from memory.redis_memory import RedisMemory as RM
+        state = orchestrator.redis.get_hash(RM.cycle_state_key())
+        assert state["status"] == "completed"
+        assert state["cycle_id"] == summary["cycle_id"]
+        for step in ("check_inventory", "forecast_demand", "create_procurement"):
+            assert state[step]["status"] == "completed"
+    test("cycle: per-step state recorded in the cycle_state hash",
+         test_cycle_state_in_memory)
+
+    def test_cycle_run_persisted():
+        runs = db.get_cycle_runs()
+        assert len(runs) == 1
+        assert runs[0]["cycle_id"] == summary["cycle_id"]
+        assert runs[0]["mode"] == "offline"
+        assert runs[0]["summary"]["procurement"]["pos_created"] == summary["procurement"]["pos_created"]
+    test("cycle: run summary persisted to the cycle_runs table", test_cycle_run_persisted)
+
+    def test_second_cycle_is_idempotent():
+        second = orchestrator.run_cycle()
+        assert second["cycle_id"] != summary["cycle_id"]
+        assert len(db.get_cycle_runs()) == 2
+        assert db.get_all_supplier_scores()[0]["overall"] > 0
+    test("cycle: a second run completes and appends a new cycle record",
+         test_second_cycle_is_idempotent)
+
+    temp_db("test_cycle.db")
+
+
+# ─────────────────────────────────────────
 # CONFIG TESTS
 # ─────────────────────────────────────────
 def suite_config():
@@ -649,6 +1199,35 @@ def suite_config():
             assert os.path.exists(path), f"Missing: {path}"
     test("config: all 4 mock data files exist at DATA_DIR", test_data_files_exist)
 
+    def test_score_weights_sum_to_one():
+        total = (config.SCORE_WEIGHT_DELIVERY + config.SCORE_WEIGHT_QUALITY
+                 + config.SCORE_WEIGHT_PRICE)
+        assert abs(total - 1.0) < 1e-9, f"weights sum to {total}"
+    test("config: supplier score weights sum to 1.0", test_score_weights_sum_to_one)
+
+    def test_tier_classification():
+        assert config.classify_supplier_tier(0.95) == "preferred"
+        assert config.classify_supplier_tier(0.90) == "preferred"
+        assert config.classify_supplier_tier(0.85) == "approved"
+        assert config.classify_supplier_tier(0.75) == "conditional"
+        assert config.classify_supplier_tier(0.10) == "at_risk"
+    test("config: tier classification at every boundary", test_tier_classification)
+
+    def test_env_overrides():
+        os.environ["SCAI_TEST_INT"] = "42"
+        os.environ["SCAI_TEST_BOOL"] = "yes"
+        try:
+            assert config._env_int("SCAI_TEST_INT", 1) == 42
+            assert config._env_int("SCAI_MISSING", 7) == 7
+            assert config._env_bool("SCAI_TEST_BOOL", False) is True
+            assert config._env_bool("SCAI_MISSING", True) is True
+            os.environ["SCAI_TEST_INT"] = "not-a-number"
+            assert config._env_int("SCAI_TEST_INT", 5) == 5
+        finally:
+            os.environ.pop("SCAI_TEST_INT", None)
+            os.environ.pop("SCAI_TEST_BOOL", None)
+    test("config: env overrides parse and fall back on bad values", test_env_overrides)
+
 
 # ─────────────────────────────────────────
 # MAIN
@@ -664,16 +1243,20 @@ if __name__ == "__main__":
     suite_data_integrity()
     suite_tools()
     suite_sqlite()
+    suite_memory_fallback()
     suite_redis()
     suite_orchestrator()
+    suite_agent_plumbing()
+    suite_agent_engines()
+    suite_full_cycle()
 
     total = PASS + FAIL
     print(f"\n{'='*60}")
     print(f"  RESULTS: {PASS}/{total} passed  |  {FAIL} failed")
     if ERRORS:
-        print(f"\n  FAILURES:")
+        print("\n  FAILURES:")
         for name, tb in ERRORS:
-            print(f"\n  ✗ {name}")
+            print(f"\n  [x] {name}")
             for line in tb.strip().split("\n")[-4:]:
                 print(f"    {line}")
     print("="*60)

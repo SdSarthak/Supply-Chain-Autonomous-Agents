@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7-alpine
@@ -25,7 +23,11 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # Leave GEMINI_API_KEY empty (or set OFFLINE_MODE=true) to run the
+      # deterministic engines instead of calling Gemini.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OFFLINE_MODE=${OFFLINE_MODE:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=0

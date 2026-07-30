@@ -1,22 +1,42 @@
+import os
 import sqlite3
+from contextlib import contextmanager
 import json
 from datetime import datetime
-from typing import Any, Optional
-from config import SQLITE_PATH
+from typing import Optional
+from config import (SQLITE_PATH, SCORE_WEIGHT_DELIVERY, SCORE_WEIGHT_QUALITY,
+                    SCORE_WEIGHT_PRICE)
+
+OPEN_PO_STATUSES = ("pending", "negotiated", "in_transit")
 
 
 class SQLiteMemory:
     def __init__(self, db_path: str = SQLITE_PATH):
         self.db_path = db_path
+        parent = os.path.dirname(os.path.abspath(db_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._init_schema()
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+    @contextmanager
+    def _connect(self):
+        """Open a connection, commit on success, and always close it.
+
+        sqlite3's own `with conn:` block manages the transaction but leaves the
+        connection open — under a long cycle that leaks handles, so closing is
+        done explicitly here.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
-        with self._conn() as conn:
+        with self._connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS demand_forecasts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,26 +96,40 @@ class SQLiteMemory:
                     resolved_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS cycle_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_id TEXT UNIQUE NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL,
+                    mode TEXT NOT NULL,
+                    pos_created INTEGER NOT NULL DEFAULT 0,
+                    risks_found INTEGER NOT NULL DEFAULT 0,
+                    summary TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_demand_sku ON demand_forecasts(sku_id);
                 CREATE INDEX IF NOT EXISTS idx_po_status ON purchase_orders(status);
+                CREATE INDEX IF NOT EXISTS idx_po_supplier ON purchase_orders(supplier_id);
                 CREATE INDEX IF NOT EXISTS idx_neg_session ON negotiation_log(session_id);
+                CREATE INDEX IF NOT EXISTS idx_disruption_open ON disruption_events(resolved_at);
             """)
 
     def insert(self, table: str, data: dict) -> int:
         cols = ", ".join(data.keys())
         placeholders = ", ".join("?" * len(data))
         sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
-        with self._conn() as conn:
+        with self._connect() as conn:
             cur = conn.execute(sql, list(data.values()))
             return cur.lastrowid
 
     def query(self, sql: str, params: tuple = ()) -> list[dict]:
-        with self._conn() as conn:
+        with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
     def execute(self, sql: str, params: tuple = ()) -> None:
-        with self._conn() as conn:
+        with self._connect() as conn:
             conn.execute(sql, params)
 
     def save_forecast(self, sku_id: str, forecast_date: str, predicted_units: float,
@@ -117,9 +151,14 @@ class SQLiteMemory:
 
     def upsert_supplier_score(self, supplier_id: str, delivery: float,
                                quality: float, price: float) -> None:
-        overall = round((delivery * 0.4 + quality * 0.35 + price * 0.25), 4)
+        overall = round(
+            delivery * SCORE_WEIGHT_DELIVERY
+            + quality * SCORE_WEIGHT_QUALITY
+            + price * SCORE_WEIGHT_PRICE,
+            4
+        )
         today = datetime.utcnow().date().isoformat()
-        with self._conn() as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO supplier_scores (supplier_id, date, delivery_score, quality_score, price_score, overall)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -152,16 +191,37 @@ class SQLiteMemory:
 
     def update_po_status(self, po_number: str, status: str, route_id: str = None,
                           expected_delivery: str = None) -> None:
-        if route_id and expected_delivery:
-            self.execute(
-                "UPDATE purchase_orders SET status=?, route_id=?, expected_delivery=? WHERE po_number=?",
-                (status, route_id, expected_delivery, po_number)
-            )
-        else:
-            self.execute(
-                "UPDATE purchase_orders SET status=? WHERE po_number=?",
-                (status, po_number)
-            )
+        assignments = ["status=?"]
+        params: list = [status]
+        if route_id:
+            assignments.append("route_id=?")
+            params.append(route_id)
+        if expected_delivery:
+            assignments.append("expected_delivery=?")
+            params.append(expected_delivery)
+        params.append(po_number)
+        self.execute(
+            f"UPDATE purchase_orders SET {', '.join(assignments)} WHERE po_number=?",
+            tuple(params)
+        )
+
+    def update_po_price(self, po_number: str, unit_price: float) -> None:
+        """Re-price a PO after negotiation, keeping total_value consistent."""
+        self.execute(
+            "UPDATE purchase_orders SET unit_price=?, total_value=ROUND(quantity*?, 2) WHERE po_number=?",
+            (unit_price, unit_price, po_number)
+        )
+
+    def get_purchase_order(self, po_number: str) -> Optional[dict]:
+        rows = self.query("SELECT * FROM purchase_orders WHERE po_number=?", (po_number,))
+        return rows[0] if rows else None
+
+    def get_open_purchase_orders(self) -> list[dict]:
+        placeholders = ", ".join("?" * len(OPEN_PO_STATUSES))
+        return self.query(
+            f"SELECT * FROM purchase_orders WHERE status IN ({placeholders}) ORDER BY created_at DESC",
+            OPEN_PO_STATUSES
+        )
 
     def log_negotiation(self, session_id: str, supplier_id: str, sku_id: str,
                          round_num: int, our_offer: float, their_offer: float,
@@ -213,3 +273,52 @@ class SQLiteMemory:
             ) latest ON ss.supplier_id=latest.supplier_id AND ss.date=latest.max_date
             ORDER BY ss.overall DESC
         """)
+
+    def save_cycle_run(self, cycle_id: str, started_at: str, completed_at: str,
+                        duration_seconds: float, mode: str, pos_created: int,
+                        risks_found: int, summary: dict) -> None:
+        """Persist a cycle summary so `main.py --report` can replay history."""
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO cycle_runs (cycle_id, started_at, completed_at, duration_seconds,
+                                        mode, pos_created, risks_found, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cycle_id) DO UPDATE SET
+                    completed_at=excluded.completed_at,
+                    duration_seconds=excluded.duration_seconds,
+                    mode=excluded.mode,
+                    pos_created=excluded.pos_created,
+                    risks_found=excluded.risks_found,
+                    summary=excluded.summary
+            """, (cycle_id, started_at, completed_at, round(duration_seconds, 2), mode,
+                  pos_created, risks_found, json.dumps(summary)))
+
+    def get_cycle_runs(self, limit: int = 10) -> list[dict]:
+        rows = self.query(
+            "SELECT * FROM cycle_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+        )
+        for r in rows:
+            try:
+                r["summary"] = json.loads(r["summary"])
+            except (TypeError, ValueError):
+                r["summary"] = {}
+        return rows
+
+    def get_latest_forecasts(self, horizon_days: int = 30) -> list[dict]:
+        """Most recent forecast per SKU for one horizon."""
+        return self.query("""
+            SELECT df.* FROM demand_forecasts df
+            INNER JOIN (
+                SELECT sku_id, MAX(created_at) AS max_created
+                FROM demand_forecasts WHERE horizon_days=? GROUP BY sku_id
+            ) latest ON df.sku_id=latest.sku_id AND df.created_at=latest.max_created
+            WHERE df.horizon_days=?
+            ORDER BY df.sku_id
+        """, (horizon_days, horizon_days))
+
+    def get_po_status_counts(self) -> dict:
+        rows = self.query(
+            "SELECT status, COUNT(*) AS n, SUM(total_value) AS value "
+            "FROM purchase_orders GROUP BY status"
+        )
+        return {r["status"]: {"count": r["n"], "value": round(r["value"] or 0.0, 2)} for r in rows}
