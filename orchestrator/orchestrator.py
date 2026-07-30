@@ -171,7 +171,9 @@ class Orchestrator:
         scope = self._resolve_scope(sku_ids)
         sku_ids = scope or self.sku_ids
         cycle_start = datetime.utcnow()
-        cycle_id = cycle_start.strftime("%Y%m%d%H%M%S")
+        # Millisecond precision: cycle_runs keys on cycle_id, so two cycles
+        # started in the same second would otherwise overwrite one another.
+        cycle_id = cycle_start.strftime("%Y%m%d%H%M%S%f")[:-3]
         self._banner(f"CYCLE START: {cycle_start.strftime('%Y-%m-%d %H:%M:%S UTC')}",
                      f"Cycle {cycle_id} | mode: {self.mode}")
 
