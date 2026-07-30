@@ -83,7 +83,7 @@ PROMPT_TEMPLATE = """Make procurement decisions based on the following data:
 
 Inventory alerts (SKUs needing reorder): {inventory_alerts}
 Demand forecasts: {forecasts}
-
+{scope_note}
 For each SKU that needs procurement:
 1. Check current inventory levels
 2. Get qualified suppliers for that SKU
@@ -139,7 +139,12 @@ class ProcurementAgent(BaseAgent):
     # ── deterministic engine ─────────────────────────────────
     @staticmethod
     def _candidate_skus(task: dict) -> list:
-        """SKUs to consider this cycle, de-duplicated, alerts first."""
+        """SKUs to consider this cycle, de-duplicated, alerts first.
+
+        When the cycle was launched against a subset of SKUs the list is
+        narrowed to that subset, so `--skus` scopes procurement too and not
+        only forecasting.
+        """
         ordered = []
         for alert in task.get("inventory_alerts", []):
             sku_id = alert.get("sku_id")
@@ -150,6 +155,10 @@ class ProcurementAgent(BaseAgent):
             for alert in get_reorder_alerts()["alerts"]:
                 if alert["sku_id"] not in ordered:
                     ordered.append(alert["sku_id"])
+        scope = task.get("sku_ids")
+        if scope:
+            in_scope = set(scope)
+            ordered = [s for s in ordered if s in in_scope]
         return ordered
 
     @staticmethod
@@ -304,16 +313,24 @@ class ProcurementAgent(BaseAgent):
         self._log(f"Processing {len(inventory_alerts)} alerts and {len(forecasts)} forecasts...")
         self.save_state({"status": "running", "started_at": datetime.utcnow().isoformat()})
 
+        scope = task.get("sku_ids")
         prompt = PROMPT_TEMPLATE.format(
             inventory_alerts=inventory_alerts,
             forecasts=forecasts,
+            scope_note="" if not scope else
+            f"This cycle is restricted to these SKUs — ignore every other SKU: "
+            f"{', '.join(scope)}\n",
             min_reliability=SUPPLIER_MIN_RELIABILITY,
             preferred_reliability=SUPPLIER_PREFERRED_RELIABILITY,
             preferred_otd=SUPPLIER_PREFERRED_OTD,
             target_fill=PROCUREMENT_TARGET_FILL,
         )
         parsed, raw = self._reason(prompt, task)
-        decisions = self._persist(parsed.get("procurement_decisions", []))
+        proposed = [d for d in parsed.get("procurement_decisions", []) if isinstance(d, dict)]
+        if scope:
+            in_scope = set(scope)
+            proposed = [d for d in proposed if d.get("sku_id") in in_scope]
+        decisions = self._persist(proposed)
 
         self._log(f"Procurement complete — {len(decisions)} purchase orders created.")
         self.save_state({"status": "completed", "pos_created": len(decisions)})

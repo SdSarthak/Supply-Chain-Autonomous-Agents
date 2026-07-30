@@ -82,6 +82,10 @@ class Orchestrator:
             name: cls(self.redis, self.sqlite, offline=self.offline)
             for name, cls in AGENT_CLASSES.items()
         }
+        # In quiet mode stdout carries the summary JSON only, so agents must
+        # not narrate onto it.
+        for agent in self.agents.values():
+            agent.quiet = self.quiet
 
     # ── output helpers ───────────────────────────────────────
     def _print(self, msg: str = "") -> None:
@@ -135,13 +139,37 @@ class Orchestrator:
             "summary": str(data)[:200] if data else ""
         })
 
+    def _resolve_scope(self, sku_ids: Optional[list]) -> Optional[list]:
+        """Validate a requested SKU subset. None means "the whole catalogue".
+
+        Unknown ids are reported and dropped. If the caller asked only for ids
+        that do not exist, the request is honoured as-is so the cycle reports
+        no work rather than silently widening to every SKU.
+        """
+        requested = [s for s in (sku_ids or []) if s]
+        if not requested:
+            return None
+        known = set(self.sku_ids)
+        scoped = [s for s in requested if s in known]
+        unknown = [s for s in requested if s not in known]
+        if unknown:
+            logger.warning("Unknown SKU ids requested: %s", ", ".join(unknown))
+            self._print(f"  ! Unknown SKU ids ignored: {', '.join(unknown)}")
+        if not scoped:
+            self._print("  ! None of the requested SKUs exist in the catalogue.")
+            return requested
+        return scoped
+
     # ── cycle ────────────────────────────────────────────────
     def run_cycle(self, sku_ids: Optional[list] = None) -> dict:
         """Synchronous entry point — runs the async cycle to completion."""
         return asyncio.run(self.run_cycle_async(sku_ids))
 
     async def run_cycle_async(self, sku_ids: Optional[list] = None) -> dict:
-        sku_ids = sku_ids or self.sku_ids
+        # `scope` is set only when the caller asked for a subset, so agents can
+        # tell "every SKU" apart from "these SKUs" and narrow their own steps.
+        scope = self._resolve_scope(sku_ids)
+        sku_ids = scope or self.sku_ids
         cycle_start = datetime.utcnow()
         cycle_id = cycle_start.strftime("%Y%m%d%H%M%S")
         self._banner(f"CYCLE START: {cycle_start.strftime('%Y-%m-%d %H:%M:%S UTC')}",
@@ -155,7 +183,7 @@ class Orchestrator:
 
         # --- STEP 1: Inventory Check ---
         self._step(1, "INVENTORY MONITORING")
-        inventory_result = await self._dispatch("check_inventory", {})
+        inventory_result = await self._dispatch("check_inventory", {"sku_ids": scope})
         reorder_needed = inventory_result.get("reorder_needed") or inventory_result.get("alerts", [])
         self._print(f"  Status: {inventory_result.get('inventory_status', 'unknown')} | "
                     f"Reorder candidates: {len(reorder_needed)}")
@@ -171,6 +199,7 @@ class Orchestrator:
         procurement_result = await self._dispatch("create_procurement", {
             "inventory_alerts": reorder_needed,
             "forecasts": forecasts,
+            "sku_ids": scope,
         })
         decisions = procurement_result.get("decisions", [])
         self._print(f"  Purchase orders created: {len(decisions)}")

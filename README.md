@@ -133,7 +133,7 @@ python main.py [--offline] [--report] [--check] [--skus SKU ...]
 | `--offline` | Run every agent on its deterministic engine (no Gemini calls) |
 | `--report` | Print the current database state — cycles, POs, scores, forecasts, disruptions — and exit |
 | `--check` | Verify config, Redis and SQLite connectivity, then exit |
-| `--skus SKU-001 SKU-002` | Restrict the cycle to specific SKUs |
+| `--skus SKU-001 SKU-002` | Restrict the whole cycle — monitoring, forecasting and procurement — to these SKUs |
 | `--allow-memory-fallback` | Keep running with in-process state when Redis is unreachable |
 | `--json` | Print only the cycle summary as JSON (suitable for piping) |
 | `--log-level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
@@ -240,7 +240,7 @@ or above is written to `disruption_events`.
 │   └── logistics_routes.json  # 12 routes across EMEA / APAC / AMER
 │
 └── tests/
-    └── test_stress.py      # 98-test suite across 10 suites
+    └── test_stress.py      # 102-test suite across 11 suites
 ```
 
 ---
@@ -325,8 +325,8 @@ prior tool outputs when reasoning about the next step. The loop also:
 python tests/test_stress.py
 ```
 
-98 tests across 10 suites — no Gemini API key required, and no test mutates tracked data.
-Without a Redis server 90 run and the Redis suite auto-skips:
+102 tests across 11 suites — no Gemini API key required, and no test mutates tracked data.
+Without a Redis server 94 run and the Redis suite auto-skips:
 
 | Suite | Covers |
 |---|---|
@@ -340,6 +340,7 @@ Without a Redis server 90 run and the Redis suite auto-skips:
 | Agent Plumbing | JSON extraction, retry classification, history sanitising, tool dispatch |
 | Agent Engines | All seven decision engines and their SQLite side effects |
 | Full Cycle | End-to-end offline cycle, bus audit trail, persistence, repeat runs |
+| SKU Scoping | `--skus` narrowing, unknown ids, quiet stdout for `--json` |
 
 ---
 

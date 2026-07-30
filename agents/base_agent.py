@@ -100,6 +100,8 @@ class BaseAgent(ABC):
         self._tool_declarations = tool_declarations
         self.redis = redis_mem
         self.sqlite = sqlite_mem
+        # Set by the orchestrator when the run must keep stdout clean (--json).
+        self.quiet = False
 
         if offline is None:
             offline = OFFLINE_MODE or not GEMINI_API_KEY
@@ -281,4 +283,5 @@ class BaseAgent(ABC):
 
     def _log(self, msg: str) -> None:
         logger.info("[%s] %s", self.name, msg)
-        print(f"  [{self.name}] {msg}")
+        if not self.quiet:
+            print(f"  [{self.name}] {msg}")

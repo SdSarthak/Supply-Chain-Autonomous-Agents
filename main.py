@@ -40,37 +40,45 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def check_prerequisites(offline: bool, allow_memory_fallback: bool,
-                        implicit_offline: bool = False) -> bool:
-    """Report on configuration and connectivity. Returns False if unusable."""
+                        implicit_offline: bool = False, stream=None) -> bool:
+    """Report on configuration and connectivity. Returns False if unusable.
+
+    `stream` defaults to stdout; `--json` passes stderr so the only thing on
+    stdout is the summary object.
+    """
     ok = True
+    out = stream or sys.stdout
+
+    def say(line: str) -> None:
+        print(line, file=out)
 
     if offline:
-        print("  - Mode: offline (deterministic engines, Gemini not used)")
+        say("  - Mode: offline (deterministic engines, Gemini not used)")
         if implicit_offline:
-            print("    (no GEMINI_API_KEY found — set one in .env to run the agents on Gemini)")
+            say("    (no GEMINI_API_KEY found — set one in .env to run the agents on Gemini)")
     elif GEMINI_API_KEY:
-        print(f"  - Gemini API key configured ({GEMINI_PRO_MODEL} / {GEMINI_FLASH_MODEL})")
+        say(f"  - Gemini API key configured ({GEMINI_PRO_MODEL} / {GEMINI_FLASH_MODEL})")
     else:
-        print("  x GEMINI_API_KEY is not set. Copy .env.example to .env and add your key,")
-        print("    or run in deterministic mode with: python main.py --offline")
+        say("  x GEMINI_API_KEY is not set. Copy .env.example to .env and add your key,")
+        say("    or run in deterministic mode with: python main.py --offline")
         ok = False
 
     redis_mem = RedisMemory()
     if redis_mem.ping():
-        print(f"  - Redis connected at {REDIS_HOST}:{REDIS_PORT}")
+        say(f"  - Redis connected at {REDIS_HOST}:{REDIS_PORT}")
     elif allow_memory_fallback:
-        print(f"  - Redis unreachable at {REDIS_HOST}:{REDIS_PORT} — using in-memory state")
+        say(f"  - Redis unreachable at {REDIS_HOST}:{REDIS_PORT} — using in-memory state")
     else:
-        print(f"  x Redis is not reachable at {REDIS_HOST}:{REDIS_PORT}")
-        print("    Start Redis:  docker run -d -p 6379:6379 redis")
-        print("    Or continue without it: python main.py --allow-memory-fallback")
+        say(f"  x Redis is not reachable at {REDIS_HOST}:{REDIS_PORT}")
+        say("    Start Redis:  docker run -d -p 6379:6379 redis")
+        say("    Or continue without it: python main.py --allow-memory-fallback")
         ok = False
 
     try:
         SQLiteMemory()
-        print(f"  - SQLite ready at {SQLITE_PATH}")
+        say(f"  - SQLite ready at {SQLITE_PATH}")
     except Exception as e:
-        print(f"  x SQLite unavailable at {SQLITE_PATH}: {e}")
+        say(f"  x SQLite unavailable at {SQLITE_PATH}: {e}")
         ok = False
 
     return ok
@@ -138,7 +146,8 @@ def main(argv: list = None) -> dict:
         print("\nSupply Chain Autonomous Intelligence Network")
         print("Checking prerequisites...")
 
-    if not check_prerequisites(offline, allow_fallback, implicit_offline):
+    if not check_prerequisites(offline, allow_fallback, implicit_offline,
+                               stream=sys.stderr if args.json_only else sys.stdout):
         sys.exit(1)
     if args.check:
         return {}

@@ -1176,6 +1176,78 @@ def suite_full_cycle():
 
 
 # ─────────────────────────────────────────
+# SKU SCOPING TESTS
+# ─────────────────────────────────────────
+def suite_sku_scope():
+    print("\n=== SKU SCOPING ===")
+    from memory.redis_memory import InMemoryStore, RedisMemory
+    from memory.sqlite_memory import SQLiteMemory
+    from orchestrator.orchestrator import Orchestrator
+
+    def build(db_name):
+        temp_db(db_name)
+        orch = Orchestrator(offline=True, quiet=True, db_path=db_name)
+        orch.redis = RedisMemory(client=InMemoryStore())
+        orch._init_agents()
+        return orch
+
+    def test_resolve_scope():
+        orch = build("test_scope_resolve.db")
+        assert orch._resolve_scope(None) is None
+        assert orch._resolve_scope([]) is None
+        assert orch._resolve_scope(["SKU-002", "SKU-005"]) == ["SKU-002", "SKU-005"]
+        # Unknown ids are dropped when at least one is real...
+        assert orch._resolve_scope(["SKU-002", "SKU-999"]) == ["SKU-002"]
+        # ...but an all-unknown request is honoured rather than widened to all.
+        assert orch._resolve_scope(["SKU-999"]) == ["SKU-999"]
+        temp_db("test_scope_resolve.db")
+    test("scope: unknown SKUs dropped, all-unknown request never widens to the catalogue",
+         test_resolve_scope)
+
+    def test_scoped_cycle_only_touches_requested_skus():
+        orch = build("test_scope_cycle.db")
+        scope = ["SKU-002", "SKU-005"]
+        summary = orch.run_cycle(sku_ids=scope)
+        db = SQLiteMemory("test_scope_cycle.db")
+
+        assert summary["inventory"]["skus_monitored"] == len(scope), \
+            f"monitored {summary['inventory']['skus_monitored']} SKUs, expected {len(scope)}"
+        assert summary["forecasting"]["skus_forecasted"] == len(scope)
+        pos = db.get_all_purchase_orders()
+        assert pos, "seeded low stock in scope must still produce POs"
+        for po in pos:
+            assert po["sku_id"] in scope, f"PO created for out-of-scope SKU {po['sku_id']}"
+        for forecast in db.get_latest_forecasts(30):
+            assert forecast["sku_id"] in scope
+        temp_db("test_scope_cycle.db")
+    test("scope: --skus narrows inventory, forecasting and procurement alike",
+         test_scoped_cycle_only_touches_requested_skus)
+
+    def test_unknown_scope_produces_no_work():
+        orch = build("test_scope_unknown.db")
+        summary = orch.run_cycle(sku_ids=["SKU-DOES-NOT-EXIST"])
+        assert summary["procurement"]["pos_created"] == 0
+        assert summary["inventory"]["skus_monitored"] == 0
+        assert summary["steps_completed"] == 7, "cycle must still complete all steps"
+        temp_db("test_scope_unknown.db")
+    test("scope: a scope matching nothing completes the cycle with no orders",
+         test_unknown_scope_produces_no_work)
+
+    def test_agents_stay_silent_when_quiet():
+        import io
+        from contextlib import redirect_stdout
+        orch = build("test_scope_quiet.db")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            orch.run_cycle(sku_ids=["SKU-002"])
+        assert buffer.getvalue() == "", \
+            f"quiet cycle wrote to stdout: {buffer.getvalue()[:120]!r}"
+        temp_db("test_scope_quiet.db")
+    test("scope: a quiet cycle keeps stdout clean for --json piping",
+         test_agents_stay_silent_when_quiet)
+
+
+# ─────────────────────────────────────────
 # CONFIG TESTS
 # ─────────────────────────────────────────
 def suite_config():
@@ -1249,6 +1321,7 @@ if __name__ == "__main__":
     suite_agent_plumbing()
     suite_agent_engines()
     suite_full_cycle()
+    suite_sku_scope()
 
     total = PASS + FAIL
     print(f"\n{'='*60}")

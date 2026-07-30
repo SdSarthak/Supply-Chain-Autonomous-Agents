@@ -73,7 +73,7 @@ TOOL_DECLARATIONS = [
 ]
 
 
-PROMPT_TEMPLATE = """Perform a comprehensive inventory health check:
+PROMPT_TEMPLATE = """Perform a comprehensive inventory health check{scope_note}:
 
 1. Get the full inventory snapshot for all SKUs
 2. Get all reorder alerts
@@ -116,8 +116,14 @@ class InventoryAgent(BaseAgent):
             offline=offline,
         )
 
-    def _cache_inventory(self) -> None:
-        for sku_id in list_sku_ids():
+    @staticmethod
+    def _scope(task: dict) -> Optional[list]:
+        """SKUs this run is restricted to, or None for the whole catalogue."""
+        requested = (task or {}).get("sku_ids")
+        return list(requested) if requested else None
+
+    def _cache_inventory(self, sku_ids: Optional[list] = None) -> None:
+        for sku_id in sku_ids or list_sku_ids():
             data = get_inventory_by_sku(sku_id)
             if "error" not in data:
                 self.redis.set(RedisMemory.inventory_key(sku_id), data, ttl=INVENTORY_CACHE_TTL)
@@ -136,9 +142,14 @@ class InventoryAgent(BaseAgent):
         return None
 
     def _offline_result(self, task: dict) -> dict:
+        scope = self._scope(task)
         snapshot = get_all_inventory()
         items = snapshot["inventory"]
         alert_urgency = {a["sku_id"]: a["urgency"] for a in get_reorder_alerts()["alerts"]}
+        if scope:
+            in_scope = set(scope)
+            items = [i for i in items if i["sku_id"] in in_scope]
+            alert_urgency = {k: v for k, v in alert_urgency.items() if k in in_scope}
 
         critical_alerts, overstock_alerts, reorder_needed = [], [], []
         for item in items:
@@ -193,16 +204,20 @@ class InventoryAgent(BaseAgent):
             "overstock_alerts": overstock_alerts,
             "reorder_needed": reorder_needed,
             "iot_summary": {"sensors_checked": len(MONITORED_SENSORS), "anomalies": anomalies},
-            "total_inventory_value_usd": snapshot["total_inventory_value_usd"],
+            "total_inventory_value_usd": snapshot["total_inventory_value_usd"] if not scope
+            else round(sum(i["stock_value_usd"] for i in items), 2),
         }
 
     def run(self, task: dict) -> dict:
-        self._log("Starting inventory monitoring cycle...")
+        scope = self._scope(task)
+        self._log("Starting inventory monitoring cycle..." if not scope
+                  else f"Starting inventory monitoring cycle for {len(scope)} SKUs...")
         self.save_state({"status": "running", "started_at": datetime.utcnow().isoformat()})
 
-        self._cache_inventory()
+        self._cache_inventory(scope)
 
         prompt = PROMPT_TEMPLATE.format(
+            scope_note="" if not scope else f" limited to these SKUs: {', '.join(scope)}",
             sensors=", ".join(MONITORED_SENSORS),
             sensor_count=len(MONITORED_SENSORS),
             critical_pct=CRITICAL_STOCK_RATIO * 100,
