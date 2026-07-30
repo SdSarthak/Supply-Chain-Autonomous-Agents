@@ -494,6 +494,34 @@ def suite_sqlite():
             assert isinstance(d["affected_skus"], list)
     test("SQLite: disruption events, sorted by severity desc", test_disruption_event_log)
 
+    def test_disruption_events_are_not_duplicated():
+        temp_db("test_disruption.db")
+        from memory.sqlite_memory import SQLiteMemory as SM
+        d = SM("test_disruption.db")
+        first = d.record_disruption("concentration", "AMER", 3, ["SKU-002"], "70% from AMER")
+        again = d.record_disruption("concentration", "AMER", 4, ["SKU-002"], "85% from AMER")
+        assert first == again, "an identical open event must be refreshed, not duplicated"
+        open_events = d.get_active_disruptions()
+        assert len(open_events) == 1
+        assert open_events[0]["severity"] == 4, "severity must be refreshed in place"
+        assert open_events[0]["description"] == "85% from AMER"
+
+        # A different SKU set is a different condition.
+        other = d.record_disruption("concentration", "AMER", 3, ["SKU-009"], "shifted")
+        assert other != first
+        assert len(d.get_active_disruptions()) == 2
+
+        resolved = d.resolve_disruptions_except([first])
+        assert resolved == 1
+        remaining = d.get_active_disruptions()
+        assert len(remaining) == 1 and remaining[0]["id"] == first
+
+        assert d.resolve_disruptions_except([]) == 1
+        assert d.get_active_disruptions() == []
+        temp_db("test_disruption.db")
+    test("SQLite: standing disruptions refresh in place and stale ones resolve",
+         test_disruption_events_are_not_duplicated)
+
     def test_all_supplier_scores():
         for i in range(1, 9):
             db.upsert_supplier_score(f"SUP-{str(i).zfill(3)}", 0.85, 0.90, 0.80)

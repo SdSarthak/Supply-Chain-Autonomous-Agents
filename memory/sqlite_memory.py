@@ -254,6 +254,55 @@ class SQLiteMemory:
             "detected_at": datetime.utcnow().isoformat()
         })
 
+    def record_disruption(self, event_type: str, region: str, severity: int,
+                          affected_skus: list, description: str = "") -> int:
+        """Open a disruption event, or refresh the matching one already open.
+
+        The risk agent re-assesses the same standing conditions on every cycle.
+        Inserting unconditionally would pile up identical rows in an open-events
+        table, so an unresolved event with the same type, region and SKU set is
+        updated in place instead — keeping its original `detected_at`, which is
+        what "how long has this been open" is measured from.
+        """
+        skus_json = json.dumps(affected_skus)
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM disruption_events WHERE event_type=? AND region=? "
+                "AND affected_skus=? AND resolved_at IS NULL LIMIT 1",
+                (event_type, region, skus_json)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE disruption_events SET severity=?, description=? WHERE id=?",
+                    (severity, description, existing["id"])
+                )
+                return existing["id"]
+            cur = conn.execute(
+                "INSERT INTO disruption_events (event_type, region, severity, "
+                "affected_skus, description, detected_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (event_type, region, severity, skus_json, description,
+                 datetime.utcnow().isoformat())
+            )
+            return cur.lastrowid
+
+    def resolve_disruptions_except(self, keep_ids: list) -> int:
+        """Close every open event the latest assessment did not re-report."""
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            if keep_ids:
+                placeholders = ", ".join("?" * len(keep_ids))
+                cur = conn.execute(
+                    "UPDATE disruption_events SET resolved_at=? WHERE resolved_at IS NULL "
+                    f"AND id NOT IN ({placeholders})",
+                    (now, *keep_ids)
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE disruption_events SET resolved_at=? WHERE resolved_at IS NULL",
+                    (now,)
+                )
+            return cur.rowcount
+
     def get_active_disruptions(self) -> list[dict]:
         rows = self.query(
             "SELECT * FROM disruption_events WHERE resolved_at IS NULL ORDER BY severity DESC"

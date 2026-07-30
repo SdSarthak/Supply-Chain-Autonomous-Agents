@@ -195,7 +195,11 @@ Tiers:  preferred >= 0.90   approved 0.80-0.89   conditional 0.70-0.79   at_risk
 **Risk.** Flags supplier reliability below threshold, country risk (>=18% high, >=12%
 medium), lead times over 20 days, single-source SKUs (severity 4) and regional concentration
 above 50% of open POs. The headline score is `min(10, Σ severity × 0.5)`; anything severity 3
-or above is written to `disruption_events`.
+or above is written to `disruption_events`. Each cycle is a full re-assessment, so a condition
+that is still standing refreshes the event already open — keeping its original `detected_at`
+rather than stacking a duplicate row — and a condition that has cleared is stamped
+`resolved_at`. `disruption_events` therefore reads as a live open-risk register, not an
+append-only log.
 
 ---
 
@@ -240,7 +244,7 @@ or above is written to `disruption_events`.
 │   └── logistics_routes.json  # 12 routes across EMEA / APAC / AMER
 │
 └── tests/
-    └── test_stress.py      # 102-test suite across 11 suites
+    └── test_stress.py      # 103-test suite across 11 suites
 ```
 
 ---
@@ -291,7 +295,7 @@ the same commands with the same semantics — including TTL expiry, `LTRIM` wind
 | `purchase_orders` | Full PO lifecycle (pending → negotiated → in_transit / cancelled) |
 | `supplier_scores` | Daily delivery/quality/price scores per vendor |
 | `negotiation_log` | Round-by-round negotiation history |
-| `disruption_events` | Risk events flagged by the Risk Agent |
+| `disruption_events` | Open-risk register — events opened, refreshed and resolved by the Risk Agent |
 | `cycle_runs` | One row per cycle, with the full summary JSON |
 
 ---
@@ -325,8 +329,8 @@ prior tool outputs when reasoning about the next step. The loop also:
 python tests/test_stress.py
 ```
 
-102 tests across 11 suites — no Gemini API key required, and no test mutates tracked data.
-Without a Redis server 94 run and the Redis suite auto-skips:
+103 tests across 11 suites — no Gemini API key required, and no test mutates tracked data.
+Without a Redis server 95 run and the Redis suite auto-skips:
 
 | Suite | Covers |
 |---|---|

@@ -241,24 +241,34 @@ class RiskAgent(BaseAgent):
         }
 
     # ── cycle step ───────────────────────────────────────────
-    def _persist(self, risks: list) -> int:
-        logged = 0
+    def _persist(self, risks: list, sweep: bool = True) -> tuple[int, int]:
+        """Record severity 3+ risks as open disruption events.
+
+        Each cycle is a full re-assessment, so events still standing are
+        refreshed rather than duplicated and events that have gone away are
+        closed. `sweep` is off when no assessment actually ran, so a failed
+        step never resolves the open log by accident.
+        """
+        open_ids, logged = [], 0
         for r in risks:
+            if not isinstance(r, dict):
+                continue
             try:
                 severity = int(r.get("severity", 0))
             except (TypeError, ValueError):
                 continue
             if severity < 3:
                 continue
-            self.sqlite.log_disruption(
+            open_ids.append(self.sqlite.record_disruption(
                 event_type=r.get("type", "unknown"),
                 region=r.get("region") or "GLOBAL",
                 severity=severity,
                 affected_skus=r.get("affected_skus", []),
                 description=r.get("description", ""),
-            )
+            ))
             logged += 1
-        return logged
+        resolved = self.sqlite.resolve_disruptions_except(open_ids) if sweep else 0
+        return logged, resolved
 
     def run(self, task: dict) -> dict:
         active_pos = task.get("active_pos", [])
@@ -278,11 +288,12 @@ class RiskAgent(BaseAgent):
         parsed, raw = self._reason(prompt, task)
 
         risks = parsed.get("risks", [])
-        logged = self._persist(risks)
+        logged, resolved = self._persist(risks, sweep="risks" in parsed)
         level = parsed.get("overall_risk_level", "unknown")
         critical = [r for r in risks if r.get("severity", 0) >= 3]
         self._log(f"Risk level: {str(level).upper()} | {len(risks)} risks | "
-                  f"{len(critical)} high/critical | {logged} logged as disruptions")
+                  f"{len(critical)} high/critical | {logged} open disruptions"
+                  + (f", {resolved} resolved" if resolved else ""))
 
         self.save_state({"status": "completed", "risk_count": len(risks)})
         return {
@@ -293,5 +304,6 @@ class RiskAgent(BaseAgent):
             "critical_actions": parsed.get("critical_actions", []),
             "resilience_recommendations": parsed.get("resilience_recommendations", []),
             "disruptions_logged": logged,
+            "disruptions_resolved": resolved,
             "raw_response": raw,
         }
