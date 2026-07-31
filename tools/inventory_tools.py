@@ -1,12 +1,19 @@
 import json
 import random
+import threading
 from datetime import datetime
 from typing import Optional
 from config import INVENTORY_FILE, DEMAND_HISTORY_FILE
+from tools.data_files import atomic_write_json, load_json_records
 
 # Demand history is a 7,300-record file; cache it after the first read so
 # forecasting 10 SKUs does not re-parse it 10 times.
 _DEMAND_CACHE: Optional[list[dict]] = None
+_DEMAND_CACHE_LOCK = threading.Lock()
+
+# update_stock is a read-modify-write over the whole inventory file and is
+# reachable from agent threads, so serialise it against itself.
+_INVENTORY_WRITE_LOCK = threading.RLock()
 
 # Raw daily rows returned to the model. Anything longer is summarised into
 # weekly buckets instead — same signal, far fewer tokens.
@@ -14,21 +21,26 @@ MAX_RAW_DEMAND_RECORDS = 30
 
 
 def _load_inventory() -> list[dict]:
-    with open(INVENTORY_FILE) as f:
-        return json.load(f)
+    return load_json_records(INVENTORY_FILE, "inventory")
 
 
 def _save_inventory(records: list[dict]) -> None:
-    with open(INVENTORY_FILE, "w") as f:
-        json.dump(records, f, indent=2)
+    """Replace the inventory master data atomically.
+
+    A plain `open(..., "w")` truncates first, so an interrupted write leaves a
+    half-written file behind and every later run dies on it — the file is read
+    during Orchestrator startup. Writing a sibling temp file and renaming it
+    means readers only ever see a complete document.
+    """
+    atomic_write_json(INVENTORY_FILE, records)
 
 
 def _load_demand_history() -> list[dict]:
     global _DEMAND_CACHE
-    if _DEMAND_CACHE is None:
-        with open(DEMAND_HISTORY_FILE) as f:
-            _DEMAND_CACHE = json.load(f)
-    return _DEMAND_CACHE
+    with _DEMAND_CACHE_LOCK:
+        if _DEMAND_CACHE is None:
+            _DEMAND_CACHE = load_json_records(DEMAND_HISTORY_FILE, "demand history")
+        return _DEMAND_CACHE
 
 
 def list_sku_ids() -> list[str]:
@@ -108,20 +120,28 @@ def get_reorder_alerts() -> dict:
 
 
 def update_stock(sku_id: str, location: str, delta: int) -> dict:
-    records = _load_inventory()
-    for r in records:
-        if r["sku_id"] == sku_id and r["location"] == location:
-            r["on_hand"] = max(0, r["on_hand"] + int(delta))
-            # Reserved stock can never exceed what is physically on hand,
-            # otherwise available = on_hand - reserved goes negative and the
-            # inventory invariant breaks.
-            r["reserved"] = min(r["reserved"], r["on_hand"])
-            r["available"] = r["on_hand"] - r["reserved"]
-            r["last_updated"] = datetime.utcnow().isoformat()
-            _save_inventory(records)
-            return {"status": "updated", "sku_id": sku_id, "location": location,
-                    "new_on_hand": r["on_hand"], "new_reserved": r["reserved"],
-                    "new_available": r["available"]}
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return {"error": f"delta must be a whole number of units, got {delta!r}"}
+
+    # Read-modify-write: without the lock two concurrent adjustments read the
+    # same snapshot and the second write silently discards the first.
+    with _INVENTORY_WRITE_LOCK:
+        records = _load_inventory()
+        for r in records:
+            if r["sku_id"] == sku_id and r["location"] == location:
+                r["on_hand"] = max(0, r["on_hand"] + delta)
+                # Reserved stock can never exceed what is physically on hand,
+                # otherwise available = on_hand - reserved goes negative and the
+                # inventory invariant breaks.
+                r["reserved"] = min(r["reserved"], r["on_hand"])
+                r["available"] = r["on_hand"] - r["reserved"]
+                r["last_updated"] = datetime.utcnow().isoformat()
+                _save_inventory(records)
+                return {"status": "updated", "sku_id": sku_id, "location": location,
+                        "new_on_hand": r["on_hand"], "new_reserved": r["reserved"],
+                        "new_available": r["available"]}
     return {"error": f"SKU {sku_id} at {location} not found"}
 
 

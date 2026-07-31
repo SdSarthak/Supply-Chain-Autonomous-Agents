@@ -7,10 +7,20 @@ import sys
 # Ensure project root is on the path regardless of how main.py is invoked.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import (GEMINI_API_KEY, GEMINI_PRO_MODEL, GEMINI_FLASH_MODEL, LOG_LEVEL,
-                    OFFLINE_MODE, REDIS_HOST, REDIS_PORT, SQLITE_PATH)
+from config import (DEMAND_HISTORY_FILE, GEMINI_API_KEY, GEMINI_PRO_MODEL,
+                    GEMINI_FLASH_MODEL, INVENTORY_FILE, LOG_LEVEL, LOGISTICS_ROUTES_FILE,
+                    OFFLINE_MODE, REDIS_HOST, REDIS_PORT, SQLITE_PATH, SUPPLIERS_FILE)
 from memory.redis_memory import RedisMemory
 from memory.sqlite_memory import SQLiteMemory
+from tools.data_files import DataFileError, REGENERATE_HINT, load_json_records
+
+# Master data every cycle reads before an agent starts.
+REQUIRED_DATA_FILES = (
+    ("inventory", INVENTORY_FILE),
+    ("suppliers", SUPPLIERS_FILE),
+    ("logistics routes", LOGISTICS_ROUTES_FILE),
+    ("demand history", DEMAND_HISTORY_FILE),
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +61,24 @@ def check_prerequisites(offline: bool, allow_memory_fallback: bool,
 
     def say(line: str) -> None:
         print(line, file=out)
+
+    # Master data first: a cycle cannot start without it, and reporting it here
+    # is the difference between an actionable message and a startup traceback.
+    broken = []
+    for label, path in REQUIRED_DATA_FILES:
+        try:
+            records = load_json_records(path, label)
+        except DataFileError as e:
+            broken.append(str(e))
+            continue
+        if not records:
+            broken.append(f"{label} data file is empty: {path} — {REGENERATE_HINT}")
+    if broken:
+        for problem in broken:
+            say(f"  x {problem}")
+        ok = False
+    else:
+        say(f"  - Master data present ({len(REQUIRED_DATA_FILES)} files)")
 
     if offline:
         say("  - Mode: offline (deterministic engines, Gemini not used)")
@@ -153,9 +181,15 @@ def main(argv: list = None) -> dict:
         return {}
 
     from orchestrator.orchestrator import Orchestrator
-    orchestrator = Orchestrator(offline=offline, allow_memory_fallback=allow_fallback,
-                                quiet=args.json_only)
-    summary = orchestrator.run_cycle(sku_ids=args.skus)
+    try:
+        orchestrator = Orchestrator(offline=offline, allow_memory_fallback=allow_fallback,
+                                    quiet=args.json_only)
+        summary = orchestrator.run_cycle(sku_ids=args.skus)
+    except DataFileError as e:
+        # Raised when master data goes missing or is corrupted mid-run — a
+        # traceback here tells the operator nothing they can act on.
+        print(f"\nCannot run the cycle: {e}", file=sys.stderr)
+        sys.exit(2)
 
     if args.json_only:
         print(json.dumps(summary, indent=2))

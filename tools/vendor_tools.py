@@ -1,12 +1,11 @@
-import json
 import random
 from datetime import datetime, timedelta
 from config import SUPPLIERS_FILE
+from tools.data_files import load_json_records
 
 
 def _load_suppliers() -> list[dict]:
-    with open(SUPPLIERS_FILE) as f:
-        return json.load(f)
+    return load_json_records(SUPPLIERS_FILE, "suppliers")
 
 
 def list_supplier_ids() -> list[str]:

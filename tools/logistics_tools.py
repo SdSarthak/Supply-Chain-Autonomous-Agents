@@ -1,8 +1,8 @@
-import json
 import random
 import zlib
 from datetime import datetime, timedelta
 from config import LOGISTICS_ROUTES_FILE
+from tools.data_files import load_json_records
 
 REGION_TO_ORIGIN = {
     "EMEA": "SUPPLIER-EMEA",
@@ -17,8 +17,7 @@ SHIPMENT_STATUSES = [
 
 
 def _load_routes() -> list[dict]:
-    with open(LOGISTICS_ROUTES_FILE) as f:
-        return json.load(f)
+    return load_json_records(LOGISTICS_ROUTES_FILE, "logistics routes")
 
 
 def get_available_routes(origin: str, destination: str) -> dict:

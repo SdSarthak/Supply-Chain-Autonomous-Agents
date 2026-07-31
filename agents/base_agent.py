@@ -192,7 +192,7 @@ class BaseAgent(ABC):
         tool_calls_made = 0
 
         for _ in range(max_tool_rounds):
-            parts = response.candidates[0].content.parts
+            parts = self._response_parts(response)
             calls = [p.function_call for p in parts
                      if getattr(p, "function_call", None) and p.function_call.name]
             if not calls:
@@ -223,11 +223,23 @@ class BaseAgent(ABC):
         return final_text
 
     @staticmethod
-    def _response_text(response) -> str:
+    def _response_parts(response) -> list:
+        """Content parts of the first candidate, or [] if there is no usable one.
+
+        A response can legitimately carry no candidate at all — safety blocks,
+        recitation stops and quota-truncated turns all return an empty
+        `candidates` list — so indexing it directly raises IndexError mid-cycle.
+        Callers treat "no parts" as "no tool calls and no text", which routes the
+        agent to its deterministic engine instead of killing the step.
+        """
         try:
-            parts = response.candidates[0].content.parts
-        except (AttributeError, IndexError):
-            return ""
+            return list(response.candidates[0].content.parts)
+        except (AttributeError, IndexError, TypeError):
+            return []
+
+    @classmethod
+    def _response_text(cls, response) -> str:
+        parts = cls._response_parts(response)
         return "".join(p.text for p in parts if getattr(p, "text", "")).strip()
 
     def _dispatch_tool(self, name: str, args: dict) -> dict:
@@ -257,7 +269,18 @@ class BaseAgent(ABC):
             result = self._offline_result(task)
             return result, json.dumps(result, indent=2)
 
-        raw = self._call_gemini(prompt)
+        try:
+            raw = self._call_gemini(prompt)
+        except Exception as e:
+            # An exhausted retry budget, a revoked key or a network outage must
+            # not take the cycle down: every agent carries a deterministic
+            # engine precisely so the step can still produce a real answer.
+            logger.exception("[%s] Gemini call failed, falling back to the "
+                             "deterministic engine", self.name)
+            self._log(f"Gemini unavailable ({type(e).__name__}: {e}) — "
+                      f"using deterministic fallback.")
+            return self._offline_result(task), f"gemini_error: {type(e).__name__}: {e}"
+
         parsed = extract_json(raw)
         if not parsed:
             self._log("Model returned no parsable JSON — using deterministic fallback.")

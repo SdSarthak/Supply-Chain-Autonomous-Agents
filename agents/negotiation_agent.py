@@ -182,14 +182,16 @@ class NegotiationAgent(BaseAgent):
             # Concede a quarter of the remaining gap each round.
             our_offer = our_offer + (their_offer - our_offer) * 0.25
 
-        if agreed_price is None and rounds:
-            agreed_price = rounds[-1]["their_offer"]
+        if agreed_price is None:
+            # No round ever closed — fall back to their last counter, or to the
+            # opening quote if the round budget produced nothing at all.
+            agreed_price = rounds[-1]["their_offer"] if rounds else round(opening_offer, 2)
 
         discount_pct = ((opening_offer - agreed_price) / opening_offer * 100) if opening_offer else 0.0
         # Take the deal when we moved them far enough, or when the price already
         # beats the market average — a deep volume tier leaves little room to
         # negotiate but is still the best price available.
-        beats_market = agreed_price is not None and agreed_price <= market_avg
+        beats_market = agreed_price <= market_avg
         outcome = ("deal_accepted"
                    if discount_pct >= NEGOTIATION_WALKAWAY_DISCOUNT * 100 or beats_market
                    else "walk_away")

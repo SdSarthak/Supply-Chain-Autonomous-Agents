@@ -72,6 +72,8 @@ coverage.xml
 
 # Test fixture left behind only if a run is interrupted
 data/inventory.json.testbak
+# Half-written master data from an interrupted atomic write
+data/.tmp-*
 
 # ── Logs ─────────────────────────────────────────────────────
 *.log
