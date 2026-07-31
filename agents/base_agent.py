@@ -76,6 +76,18 @@ def extract_json(text: str) -> dict:
     return {}
 
 
+def as_float(value, default: float = 0.0) -> float:
+    """Coerce a model-supplied number, falling back rather than raising.
+
+    Gemini happily answers with `"8%"` or `null` where a number was asked for,
+    and a bare `float()` on that takes the whole cycle step down.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def is_retryable(error: Exception) -> bool:
     message = f"{type(error).__name__} {error}".lower()
     return any(marker in message for marker in RETRYABLE_ERROR_MARKERS)

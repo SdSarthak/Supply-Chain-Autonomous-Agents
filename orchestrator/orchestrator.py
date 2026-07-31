@@ -234,6 +234,12 @@ class Orchestrator:
             negotiation = negotiations.get(po_number, {})
             if negotiation.get("outcome") == "walk_away":
                 continue
+            if negotiation.get("error"):
+                # The negotiation step never completed, so the PO still sits at
+                # its un-negotiated price. Routing it would book a shipment
+                # against a price nobody agreed to.
+                self._print(f"    ! {po_number}: negotiation failed, not routed")
+                continue
             shippable.append({
                 "po_number": po_number,
                 "supplier_id": decision.get("selected_supplier_id"),

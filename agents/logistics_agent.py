@@ -1,7 +1,7 @@
 from typing import Optional
 
 import google.ai.generativelanguage as glm
-from agents.base_agent import BaseAgent
+from agents.base_agent import BaseAgent, as_float
 from tools.logistics_tools import (get_available_routes, get_routes_by_supplier_region,
                                     select_route_for_region, estimate_delivery,
                                     track_shipment)
@@ -198,15 +198,25 @@ class LogisticsAgent(BaseAgent):
     def _persist(self, assignments: list) -> list:
         applied = []
         for a in assignments:
+            # On the Gemini path this list is model output — an entry that is
+            # not an object would otherwise raise AttributeError here.
+            if not isinstance(a, dict):
+                self._log(f"Ignoring malformed assignment: {a!r}")
+                continue
             po_number = a.get("po_number")
             if not po_number:
                 continue
-            self.sqlite.update_po_status(
+            updated = self.sqlite.update_po_status(
                 po_number=po_number,
                 status="in_transit",
                 route_id=a.get("selected_route_id"),
                 expected_delivery=a.get("estimated_arrival"),
             )
+            if not updated:
+                # Reporting a route for a PO that does not exist would overstate
+                # the cycle summary.
+                self._log(f"Ignoring assignment for unknown PO {po_number}")
+                continue
             applied.append(a)
             self._log(f"PO {po_number}: {a.get('carrier')} via {a.get('mode')} "
                       f"to {a.get('warehouse_destination')}, ETA {a.get('estimated_arrival')}")
@@ -227,13 +237,21 @@ class LogisticsAgent(BaseAgent):
         parsed, raw = self._reason(prompt, task)
         assignments = self._persist(parsed.get("assignments", []))
 
+        # Totals are derived from the routes that were actually applied, not
+        # from whatever the model reported, so a dropped assignment cannot
+        # inflate the cycle summary.
+        total_cost = round(sum(as_float(a.get("shipping_cost_usd")) for a in assignments), 2)
+        avg_transit = round(
+            sum(as_float(a.get("transit_days")) for a in assignments) / len(assignments), 1
+        ) if assignments else 0.0
+
         self._log(f"Logistics assignments complete — {len(assignments)} routed.")
         self.save_state({"status": "completed", "assigned": len(assignments)})
         return {
             "agent": self.name,
             "assignments": assignments,
             "unassigned": parsed.get("unassigned", []),
-            "total_shipping_cost": parsed.get("total_shipping_cost", 0.0),
-            "avg_transit_days": parsed.get("avg_transit_days", 0.0),
+            "total_shipping_cost": total_cost,
+            "avg_transit_days": avg_transit,
             "raw_response": raw,
         }

@@ -128,9 +128,10 @@ class SQLiteMemory:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
-    def execute(self, sql: str, params: tuple = ()) -> None:
+    def execute(self, sql: str, params: tuple = ()) -> int:
+        """Run a statement and return how many rows it actually touched."""
         with self._connect() as conn:
-            conn.execute(sql, params)
+            return conn.execute(sql, params).rowcount
 
     def save_forecast(self, sku_id: str, forecast_date: str, predicted_units: float,
                       confidence: float, horizon_days: int) -> int:
@@ -190,7 +191,12 @@ class SQLiteMemory:
         })
 
     def update_po_status(self, po_number: str, status: str, route_id: str = None,
-                          expected_delivery: str = None) -> None:
+                          expected_delivery: str = None) -> int:
+        """Move a PO to a new status. Returns the number of rows updated.
+
+        Zero means the PO number does not exist — worth reporting, because on
+        the Gemini path the number came out of a model response.
+        """
         assignments = ["status=?"]
         params: list = [status]
         if route_id:
@@ -200,14 +206,14 @@ class SQLiteMemory:
             assignments.append("expected_delivery=?")
             params.append(expected_delivery)
         params.append(po_number)
-        self.execute(
+        return self.execute(
             f"UPDATE purchase_orders SET {', '.join(assignments)} WHERE po_number=?",
             tuple(params)
         )
 
-    def update_po_price(self, po_number: str, unit_price: float) -> None:
+    def update_po_price(self, po_number: str, unit_price: float) -> int:
         """Re-price a PO after negotiation, keeping total_value consistent."""
-        self.execute(
+        return self.execute(
             "UPDATE purchase_orders SET unit_price=?, total_value=ROUND(quantity*?, 2) WHERE po_number=?",
             (unit_price, unit_price, po_number)
         )

@@ -184,6 +184,9 @@ class DemandForecastingAgent(BaseAgent):
         saved = []
         today = datetime.utcnow().date()
         for fc in forecasts:
+            # Model output: an entry that is not an object must not crash the step.
+            if not isinstance(fc, dict):
+                continue
             sku_id = fc.get("sku_id")
             if not sku_id:
                 continue

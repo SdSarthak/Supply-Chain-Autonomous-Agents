@@ -1,7 +1,7 @@
 from typing import Optional
 
 import google.ai.generativelanguage as glm
-from agents.base_agent import BaseAgent
+from agents.base_agent import BaseAgent, as_float
 from tools.vendor_tools import (get_supplier_info, get_market_price_benchmark,
                                 list_supplier_ids)
 from memory.redis_memory import RedisMemory
@@ -193,6 +193,9 @@ class SupplierPerformanceAgent(BaseAgent):
     def _persist(self, scores: list) -> list:
         saved = []
         for s in scores:
+            # Model output: an entry that is not an object must not crash the step.
+            if not isinstance(s, dict):
+                continue
             supplier_id = s.get("supplier_id")
             if not supplier_id:
                 continue
@@ -207,7 +210,7 @@ class SupplierPerformanceAgent(BaseAgent):
             )
             saved.append(s)
             self._log(f"{supplier_id} ({s.get('supplier_name', '?')}): "
-                      f"{float(s.get('overall_score', 0)):.2f} [{s.get('tier', 'approved')}]")
+                      f"{as_float(s.get('overall_score')):.2f} [{s.get('tier', 'approved')}]")
         return saved
 
     def run(self, task: dict) -> dict:

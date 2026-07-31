@@ -1153,6 +1153,85 @@ def suite_gemini_turn():
 
 
 # ─────────────────────────────────────────
+# MODEL OUTPUT HYGIENE
+# ─────────────────────────────────────────
+def suite_model_output():
+    print("\n=== MODEL OUTPUT HYGIENE ===")
+    from agents.base_agent import as_float
+    from agents.logistics_agent import LogisticsAgent
+    from agents.negotiation_agent import NegotiationAgent
+    from agents.demand_forecasting_agent import DemandForecastingAgent
+    from agents.supplier_performance_agent import SupplierPerformanceAgent
+    from memory.redis_memory import RedisMemory, InMemoryStore
+    from memory.sqlite_memory import SQLiteMemory
+
+    temp_db("test_modelout.db")
+    redis_mem = RedisMemory(client=InMemoryStore())
+    db = SQLiteMemory("test_modelout.db")
+    db.create_purchase_order("PO-REAL-001", "SUP-001", "SKU-001", 100, 10.0)
+
+    def test_as_float():
+        assert as_float("8.5") == 8.5
+        assert as_float(None) == 0.0
+        assert as_float("8%") == 0.0
+        assert as_float("nope", 1.5) == 1.5
+    check("model output: numbers that are not numbers coerce instead of raising",
+         test_as_float)
+
+    def test_update_reports_missing_rows():
+        assert db.update_po_status("PO-REAL-001", "negotiated") == 1
+        assert db.update_po_status("PO-GHOST-999", "negotiated") == 0
+        assert db.update_po_price("PO-GHOST-999", 9.0) == 0
+    check("model output: a status update for an unknown PO reports zero rows",
+         test_update_reports_missing_rows)
+
+    def test_logistics_drops_bad_assignments():
+        agent = LogisticsAgent(redis_mem, db, offline=True)
+        agent.quiet = True
+        applied = agent._persist([
+            "PO-REAL-001",                                    # not an object
+            {"po_number": "PO-GHOST-999", "shipping_cost_usd": 500.0},
+            {"po_number": "PO-REAL-001", "selected_route_id": "RT-001",
+             "estimated_arrival": "2026-08-30", "shipping_cost_usd": 250.0,
+             "transit_days": 4},
+        ])
+        assert [a["po_number"] for a in applied] == ["PO-REAL-001"], applied
+        assert db.get_purchase_order("PO-REAL-001")["status"] == "in_transit"
+        assert db.get_purchase_order("PO-GHOST-999") is None
+    check("model output: routes for unknown or malformed POs are not applied",
+         test_logistics_drops_bad_assignments)
+
+    def test_negotiation_ignores_unknown_po():
+        agent = NegotiationAgent(redis_mem, db, offline=True)
+        agent.quiet = True
+        before = db.get_purchase_order("PO-REAL-001")["unit_price"]
+        agent._persist("sess-1", {
+            "po_number": "PO-GHOST-999", "outcome": "deal_accepted",
+            "final_agreed_price": "7.50", "rounds": ["not a round"],
+        }, {})
+        assert db.get_purchase_order("PO-REAL-001")["unit_price"] == before
+        assert db.get_negotiation_history("sess-1") == []
+    check("model output: a deal on a PO that does not exist is not booked",
+         test_negotiation_ignores_unknown_po)
+
+    def test_persist_skips_non_objects():
+        forecaster = DemandForecastingAgent(redis_mem, db, offline=True)
+        forecaster.quiet = True
+        assert forecaster._persist(["SKU-001", None, {"sku_id": "SKU-001",
+                                                     "forecast_30d": 10}]) == \
+            [{"sku_id": "SKU-001", "forecast_30d": 10}]
+        scorer = SupplierPerformanceAgent(redis_mem, db, offline=True)
+        scorer.quiet = True
+        assert scorer._persist(["SUP-001", {"supplier_id": "SUP-001",
+                                            "overall_score": "n/a"}]) == \
+            [{"supplier_id": "SUP-001", "overall_score": "n/a"}]
+    check("model output: forecast and score lists tolerate non-object entries",
+         test_persist_skips_non_objects)
+
+    temp_db("test_modelout.db")
+
+
+# ─────────────────────────────────────────
 # MASTER DATA FILES
 # ─────────────────────────────────────────
 def suite_data_files():
@@ -1685,6 +1764,7 @@ SUITES = (
     suite_orchestrator,
     suite_agent_plumbing,
     suite_gemini_turn,
+    suite_model_output,
     suite_data_files,
     suite_agent_engines,
     suite_full_cycle,

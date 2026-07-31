@@ -2,7 +2,7 @@ import uuid
 from typing import Optional
 
 import google.ai.generativelanguage as glm
-from agents.base_agent import BaseAgent
+from agents.base_agent import BaseAgent, as_float
 from tools.vendor_tools import (get_supplier_offer, get_market_price_benchmark,
                                  simulate_supplier_counter_offer,
                                  SUPPLIER_PRICE_FLOOR_PCT)
@@ -217,7 +217,7 @@ class NegotiationAgent(BaseAgent):
     def _persist(self, session_id: str, parsed: dict, task: dict) -> None:
         supplier_id = parsed.get("supplier_id") or task.get("supplier_id") or "UNKNOWN"
         sku_id = parsed.get("sku_id") or task.get("sku_id") or "UNKNOWN"
-        rounds = parsed.get("rounds") or []
+        rounds = [r for r in (parsed.get("rounds") or []) if isinstance(r, dict)]
         total_rounds = len(rounds)
 
         for entry in rounds:
@@ -235,12 +235,15 @@ class NegotiationAgent(BaseAgent):
             )
 
         po_number = parsed.get("po_number") or task.get("po_number")
-        final_price = parsed.get("final_agreed_price")
-        if parsed.get("outcome") == "deal_accepted" and po_number and final_price:
-            self.sqlite.update_po_price(po_number, round(float(final_price), 2))
+        final_price = as_float(parsed.get("final_agreed_price"))
+        if parsed.get("outcome") == "deal_accepted" and po_number and final_price > 0:
+            if not self.sqlite.update_po_price(po_number, round(final_price, 2)):
+                # The PO number came back from the model and matches nothing.
+                self._log(f"Cannot record the deal — unknown PO {po_number}")
+                return
             self.sqlite.update_po_status(po_number, "negotiated")
-            self._log(f"Deal accepted at ${float(final_price):.2f}/unit "
-                      f"({float(parsed.get('discount_achieved_pct', 0)):.1f}% off opening offer)")
+            self._log(f"Deal accepted at ${final_price:.2f}/unit "
+                      f"({as_float(parsed.get('discount_achieved_pct')):.1f}% off opening offer)")
         elif po_number:
             self.sqlite.update_po_status(po_number, "cancelled")
             self._log(f"Walked away from {po_number} — no acceptable price")
