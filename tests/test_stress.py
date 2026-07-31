@@ -930,6 +930,349 @@ def suite_agent_plumbing():
 
 
 # ─────────────────────────────────────────
+# GEMINI TURN (fake model, no API key)
+# ─────────────────────────────────────────
+class _FakeFunctionCall:
+    def __init__(self, name, args=None):
+        self.name = name
+        self.args = args or {}
+
+
+class _FakePart:
+    """One content part — either text or a function call, never both."""
+
+    def __init__(self, text="", function_call=None):
+        self.text = text
+        self.function_call = function_call
+
+
+class _FakeResponse:
+    def __init__(self, *parts, blocked=False):
+        content = type("Content", (), {"parts": list(parts)})()
+        candidate = type("Candidate", (), {"content": content})()
+        # A safety block / recitation stop returns no candidate at all.
+        self.candidates = [] if blocked else [candidate]
+
+
+class _FakeChat:
+    """Replays a scripted sequence of responses, recording what was sent."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.sent = []
+
+    def send_message(self, message):
+        self.sent.append(message)
+        assert self._script, f"send_message called {len(self.sent)} times, script exhausted"
+        item = self._script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _FakeModel:
+    def __init__(self, chat):
+        self.chat = chat
+        self.history_seen = None
+
+    def start_chat(self, history=None):
+        self.history_seen = history
+        return self.chat
+
+
+def _probe_agent(script, tools=None, db_name="test_gemini.db"):
+    """A BaseAgent wired to a fake Gemini model instead of the real SDK."""
+    from agents.base_agent import BaseAgent
+    from memory.redis_memory import RedisMemory, InMemoryStore
+    from memory.sqlite_memory import SQLiteMemory
+
+    class ProbeAgent(BaseAgent):
+        def run(self, task):
+            return self._reason("do the thing", task)
+
+        def _offline_result(self, task):
+            self.offline_calls += 1
+            return {"engine": "deterministic"}
+
+    temp_db(db_name)
+    agent = ProbeAgent(
+        name="probe", model="fake-model", system_prompt="probe",
+        tools=tools or {}, tool_declarations=[],
+        redis_mem=RedisMemory(client=InMemoryStore()),
+        sqlite_mem=SQLiteMemory(db_name), offline=True,
+    )
+    agent.offline_calls = 0
+    agent.quiet = True
+    chat = _FakeChat(script)
+    agent._model = _FakeModel(chat)
+    agent.offline = False
+    return agent, chat
+
+
+def suite_gemini_turn():
+    print("\n=== GEMINI TURN (fake model) ===")
+    import config
+    from agents import base_agent as ba
+
+    ANSWER = '```json\n{"forecasts": [{"sku_id": "SKU-001"}]}\n```'
+
+    def test_tool_round_trip():
+        calls = []
+
+        def lookup(sku_id):
+            calls.append(sku_id)
+            return {"sku_id": sku_id, "available": 42}
+
+        agent, chat = _probe_agent(
+            [_FakeResponse(_FakePart(function_call=_FakeFunctionCall(
+                "lookup", {"sku_id": "SKU-001"}))),
+             _FakeResponse(_FakePart(text=ANSWER))],
+            tools={"lookup": lookup},
+        )
+        parsed, raw = agent.run({})
+        assert calls == ["SKU-001"], calls
+        assert parsed["forecasts"][0]["sku_id"] == "SKU-001", parsed
+        assert agent.offline_calls == 0, "deterministic engine should not have run"
+        # The tool result must go back as a function_response payload.
+        reply = chat.sent[1]
+        assert isinstance(reply, list) and len(reply) == 1, reply
+        fr = reply[0]["function_response"]
+        assert fr["name"] == "lookup" and fr["response"]["available"] == 42, fr
+        # Both turns are persisted for the next call.
+        history = agent._get_chat_history()
+        assert [t["role"] for t in history] == ["user", "model"], history
+    check("gemini: tool call is dispatched and its result fed back to the model",
+         test_tool_round_trip)
+
+    def test_unknown_tool_reported_to_model():
+        agent, chat = _probe_agent(
+            [_FakeResponse(_FakePart(function_call=_FakeFunctionCall("ghost_tool", {}))),
+             _FakeResponse(_FakePart(text='{"ok": true}'))],
+            tools={},
+        )
+        parsed, _ = agent.run({})
+        assert parsed == {"ok": True}, parsed
+        response = chat.sent[1][0]["function_response"]["response"]
+        assert "error" in response and "ghost_tool" in response["error"], response
+    check("gemini: a tool the agent does not implement returns an error part, not a crash",
+         test_unknown_tool_reported_to_model)
+
+    def test_blocked_response_falls_back():
+        # candidates == [] used to raise IndexError and fail the whole step.
+        agent, chat = _probe_agent([_FakeResponse(blocked=True),
+                                    _FakeResponse(blocked=True)])
+        parsed, raw = agent.run({})
+        assert parsed == {"engine": "deterministic"}, parsed
+        assert agent.offline_calls == 1
+        assert chat.sent[-1] == ba.FINAL_ANSWER_NUDGE
+    check("gemini: a blocked response with no candidates degrades to the engine",
+         test_blocked_response_falls_back)
+
+    def test_tool_budget_exhausted():
+        rounds = config.MAX_TOOL_ROUNDS
+        tool_call = lambda: _FakeResponse(  # noqa: E731
+            _FakePart(function_call=_FakeFunctionCall("ping", {})))
+        agent, chat = _probe_agent(
+            [tool_call() for _ in range(rounds + 1)] + [_FakeResponse(_FakePart(text=ANSWER))],
+            tools={"ping": lambda: {"pong": True}},
+        )
+        parsed, _ = agent.run({})
+        # One dispatch per round, then a single nudge for the final answer.
+        assert len(chat.sent) == rounds + 2, len(chat.sent)
+        assert chat.sent[-1] == ba.FINAL_ANSWER_NUDGE
+        assert parsed["forecasts"][0]["sku_id"] == "SKU-001", parsed
+    check("gemini: the tool budget is capped and a final answer is requested once",
+         test_tool_budget_exhausted)
+
+    def test_retry_then_success():
+        slept = []
+        original = ba.time.sleep
+        ba.time.sleep = slept.append
+        try:
+            agent, chat = _probe_agent(
+                [Exception("503 Service Unavailable"),
+                 _FakeResponse(_FakePart(text='{"recovered": true}'))])
+            parsed, _ = agent.run({})
+        finally:
+            ba.time.sleep = original
+        assert parsed == {"recovered": True}, parsed
+        assert slept == [config.GEMINI_RETRY_BASE_DELAY], slept
+        assert len(chat.sent) == 2
+    check("gemini: a retryable 5xx is retried with the configured backoff",
+         test_retry_then_success)
+
+    def test_non_retryable_is_not_retried():
+        slept = []
+        original = ba.time.sleep
+        ba.time.sleep = slept.append
+        try:
+            agent, chat = _probe_agent([ValueError("401 invalid api key")])
+            parsed, raw = agent.run({})
+        finally:
+            ba.time.sleep = original
+        assert slept == [], "an auth failure must not be retried"
+        assert len(chat.sent) == 1
+        # An unrecoverable call still produces a real answer from the engine.
+        assert parsed == {"engine": "deterministic"}, parsed
+        assert raw.startswith("gemini_error: ValueError"), raw
+    check("gemini: an auth failure is not retried and falls back to the engine",
+         test_non_retryable_is_not_retried)
+
+    def test_retries_exhausted_falls_back():
+        attempts = config.GEMINI_MAX_RETRIES + 1
+        original = ba.time.sleep
+        ba.time.sleep = lambda _s: None
+        try:
+            agent, chat = _probe_agent([Exception("429 rate limit") for _ in range(attempts)])
+            parsed, raw = agent.run({})
+        finally:
+            ba.time.sleep = original
+        assert len(chat.sent) == attempts, chat.sent
+        assert parsed == {"engine": "deterministic"}, parsed
+        assert agent.offline_calls == 1
+    check("gemini: an exhausted retry budget does not propagate out of the agent",
+         test_retries_exhausted_falls_back)
+
+    def test_history_sent_is_sanitised():
+        from memory.redis_memory import RedisMemory
+        agent, chat = _probe_agent([_FakeResponse(_FakePart(text='{"ok": 1}'))])
+        key = RedisMemory.agent_history_key("probe")
+        for turn in [{"role": "model", "parts": [{"text": "orphan"}]},
+                     {"role": "user", "parts": [{"text": "hello"}]},
+                     {"role": "model", "parts": [{"text": "hi"}]},
+                     {"role": "user", "parts": [{"text": "dangling"}]}]:
+            agent.redis.append_to_list(key, turn)
+        agent.run({})
+        sent = agent._model.history_seen
+        assert [t["role"] for t in sent] == ["user", "model"], sent
+        assert sent[0]["parts"][0]["text"] == "hello", sent
+    check("gemini: stored history is repaired before it is replayed to the model",
+         test_history_sent_is_sanitised)
+
+    temp_db("test_gemini.db")
+
+
+# ─────────────────────────────────────────
+# MASTER DATA FILES
+# ─────────────────────────────────────────
+def suite_data_files():
+    print("\n=== MASTER DATA FILES ===")
+    import config
+    from tools.data_files import DataFileError, atomic_write_json, load_json_records
+
+    scratch = os.path.join("data", "_scratch_datafiles")
+    os.makedirs(scratch, exist_ok=True)
+
+    def test_missing_file_names_itself():
+        path = os.path.join(scratch, "absent.json")
+        try:
+            load_json_records(path, "inventory")
+            assert False, "expected DataFileError"
+        except DataFileError as e:
+            assert "absent.json" in str(e) and "generate_mock_data.py" in str(e), e
+    check("data files: a missing file raises an error naming the file and the fix",
+         test_missing_file_names_itself)
+
+    def test_corrupt_file_reports_position():
+        path = os.path.join(scratch, "corrupt.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('[{"sku_id": "SKU-001"} ')
+        try:
+            load_json_records(path, "inventory")
+            assert False, "expected DataFileError"
+        except DataFileError as e:
+            assert "corrupt.json" in str(e) and "line 1" in str(e), e
+    check("data files: a truncated file reports the file and the parse position",
+         test_corrupt_file_reports_position)
+
+    def test_wrong_shape_rejected():
+        path = os.path.join(scratch, "object.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"sku_id": "SKU-001"}')
+        try:
+            load_json_records(path, "inventory")
+            assert False, "expected DataFileError"
+        except DataFileError as e:
+            assert "array" in str(e), e
+    check("data files: a JSON object where an array is required is rejected",
+         test_wrong_shape_rejected)
+
+    def test_atomic_write_roundtrip():
+        path = os.path.join(scratch, "written.json")
+        atomic_write_json(path, [{"sku_id": "SKU-001", "on_hand": 5}])
+        assert load_json_records(path, "inventory")[0]["on_hand"] == 5
+        assert not [f for f in os.listdir(scratch) if f.startswith(".tmp-")]
+    check("data files: an atomic write lands and leaves no temp file behind",
+         test_atomic_write_roundtrip)
+
+    def test_failed_write_leaves_original_intact():
+        path = os.path.join(scratch, "keepme.json")
+        atomic_write_json(path, [{"sku_id": "SKU-001"}])
+        # A payload json.dump cannot serialise fails halfway through the write.
+        try:
+            atomic_write_json(path, [{"bad": {1, 2, 3}}])
+            assert False, "expected the write to fail"
+        except TypeError:
+            pass
+        assert load_json_records(path, "inventory") == [{"sku_id": "SKU-001"}]
+        assert not [f for f in os.listdir(scratch) if f.startswith(".tmp-")]
+    check("data files: a failed write neither truncates the original nor leaks a temp file",
+         test_failed_write_leaves_original_intact)
+
+    @protect_inventory_file
+    def test_concurrent_update_stock_does_not_lose_writes():
+        from tools.inventory_tools import update_stock, get_inventory_by_sku
+        before = get_inventory_by_sku("SKU-001")["total_on_hand"]
+        errors = []
+
+        def bump():
+            try:
+                for _ in range(10):
+                    update_stock("SKU-001", "WH-NORTH", 1)
+            except Exception as e:  # noqa: BLE001 — surfaced through `errors`
+                errors.append(e)
+
+        threads = [threading.Thread(target=bump) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        after = get_inventory_by_sku("SKU-001")["total_on_hand"]
+        assert after == before + 40, f"{before} -> {after}, expected +40"
+    check("data files: 4 threads x 10 stock updates all land (no lost read-modify-write)",
+         test_concurrent_update_stock_does_not_lose_writes)
+
+    def test_bad_delta_rejected():
+        from tools.inventory_tools import update_stock
+        assert "error" in update_stock("SKU-001", "WH-NORTH", "lots")
+        assert "error" in update_stock("SKU-001", "NOWHERE", 1)
+    check("data files: update_stock rejects a non-numeric delta and an unknown location",
+         test_bad_delta_rejected)
+
+    def test_env_bounds_clamped():
+        os.environ["SCAI_BOUND"] = "0"
+        try:
+            assert config._env_int("SCAI_BOUND", 5, minimum=1) == 1
+            assert config._env_int("SCAI_BOUND", 5, minimum=0) == 0
+            os.environ["SCAI_BOUND"] = "9999"
+            assert config._env_int("SCAI_BOUND", 5, maximum=50) == 50
+            os.environ["SCAI_BOUND"] = "1.5"
+            assert config._env_float("SCAI_BOUND", 0.8, maximum=1.0) == 1.0
+            assert config._env_float("SCAI_BOUND", 0.8) == 1.5
+        finally:
+            os.environ.pop("SCAI_BOUND", None)
+        # The settings that used to break the engines are bounded.
+        assert config.NEGOTIATION_MAX_ROUNDS >= 1
+        assert config.AGENT_CHAT_HISTORY_MAX >= 2
+        assert config.MAX_TOOL_ROUNDS >= 1
+    check("config: out-of-range env overrides are clamped to a usable value",
+         test_env_bounds_clamped)
+
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
+# ─────────────────────────────────────────
 # AGENT DECISION ENGINES (offline)
 # ─────────────────────────────────────────
 @protect_inventory_file
@@ -1341,6 +1684,8 @@ SUITES = (
     suite_redis,
     suite_orchestrator,
     suite_agent_plumbing,
+    suite_gemini_turn,
+    suite_data_files,
     suite_agent_engines,
     suite_full_cycle,
     suite_sku_scope,
