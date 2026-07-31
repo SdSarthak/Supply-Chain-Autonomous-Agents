@@ -244,7 +244,7 @@ append-only log.
 │   └── logistics_routes.json  # 12 routes across EMEA / APAC / AMER
 │
 └── tests/
-    └── test_stress.py      # 103-test suite across 11 suites
+    └── test_stress.py      # 124-test suite across 14 suites
 ```
 
 ---
@@ -319,7 +319,10 @@ prior tool outputs when reasoning about the next step. The loop also:
 - asks once for a final answer if the tool budget runs out mid-plan;
 - parses JSON by brace matching, so fenced blocks and trailing prose are handled;
 - sanitises replayed chat history (drops empty, orphaned or dangling turns) before sending;
-- never lets a tool exception escape — errors are returned to the model as `{"error": ...}`.
+- never lets a tool exception escape — errors are returned to the model as `{"error": ...}`;
+- treats a response with no candidate (safety block, recitation stop) as "no answer";
+- falls back to the agent's deterministic engine when Gemini cannot be reached at all, so a
+  quota or outage degrades the cycle rather than stopping it.
 
 ---
 
@@ -329,8 +332,8 @@ prior tool outputs when reasoning about the next step. The loop also:
 python tests/test_stress.py
 ```
 
-103 tests across 11 suites — no Gemini API key required, and no test mutates tracked data.
-Without a Redis server 95 run and the Redis suite auto-skips:
+124 tests across 14 suites — no Gemini API key required, and no test mutates tracked data.
+Without a Redis server 116 run and the Redis suite auto-skips:
 
 | Suite | Covers |
 |---|---|
@@ -342,6 +345,9 @@ Without a Redis server 95 run and the Redis suite auto-skips:
 | Redis Memory | Same against a real server — auto-skips if Redis is not running |
 | Orchestrator | Message bus, priority ordering, timeout, task routing |
 | Agent Plumbing | JSON extraction, retry classification, history sanitising, tool dispatch |
+| Gemini Turn | Tool-calling loop, tool budget, backoff, blocked responses — against a fake model |
+| Model Output | Malformed responses, hallucinated PO numbers, uncastable numbers |
+| Master Data | Missing/corrupt/wrong-shape files, atomic writes, concurrent stock updates |
 | Agent Engines | All seven decision engines and their SQLite side effects |
 | Full Cycle | End-to-end offline cycle, bus audit trail, persistence, repeat runs |
 | SKU Scoping | `--skus` narrowing, unknown ids, quiet stdout for `--json` |
